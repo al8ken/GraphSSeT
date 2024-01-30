@@ -24,8 +24,8 @@ meanD = (2**-phi)/1000 # input is phi so convert to m
 stdD = float(sys.argv[6]) # standard deviation of ln(grainsize)
 rhog = float(sys.argv[7]) #kg m-3
 Dsig = float(sys.argv[8]) #m^-1
-K = float(sys.argv[9])
-L = float(sys.argv[10])
+K = float(sys.argv[9]) #erosion law preexponent
+L = float(sys.argv[10]) #erosion law exponent
 samp_n = int(sys.argv[11]) #number of samples to define grain size populations...less is quicker but more variable
 dt = float(sys.argv[12])*3600 # input in hours
 
@@ -71,21 +71,23 @@ def TrackDet(t,Graph,Output = [[],[]], Vprop = 'VSo', Dprop = 'detritus_node'):
     OutletVolumeFlux = np.array([Graph.nodes[key][Vprop] for key in Graph.nodes])
     TotalVolumeFlux = np.nansum(OutletVolumeFlux)
     OutletDetritus = [Graph.nodes[key][Dprop] for key in Graph.nodes]
-    DetritalProps = np.zeros(len(OutletDetritus[0].keys()))
-    for m,key in enumerate(OutletDetritus[0].keys()):
+    DetritalProps = {key: 0.0 for key in OutletDetritus[0].keys()}
+    for key in DetritalProps.keys():
         for i,j in enumerate(OutletDetritus):
-           DetritalProps[m] += j[key]*OutletVolumeFlux[i]/TotalVolumeFlux
-    Output[0].append(t) # time of timestep (s)
-    Output[1].append(OutletDetritus) # detrital proportions at each node for that timestep
-    Output[2].append(DetritalProps) # volume-weighted detrital proportions across all nodes for that timestep
+           val1 = DetritalProps[key]
+           val2 = j[key]*OutletVolumeFlux[i]/TotalVolumeFlux
+           DetritalProps[key] = val1+val2
+    Output[0].append(t)
+    Output[1].append(OutletDetritus)
+    Output[2].append(DetritalProps)
 
 # Function to make a Figure - here we plot flux density, jam status, till thickness and grain size but any edge property could be plotted
 def MakeFig(Network,SubNet):
     fig,axs = plt.subplots(4,1, figsize = (8,8), dpi = 300)
-    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, prop = 'flux_density', lw = 0.75, cmap = 'inferno', minprop= 0, maxprop = 50, fig = fig, ax = axs[0])
-    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, prop = 'jammed', lw = 0.75, cmap = 'inferno', minprop= 0.0, maxprop = 1.0, fig = fig, ax = axs[1])
-    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, prop = 'till_thickness', lw = 0.75, cmap = 'inferno', minprop= 0.0, maxprop = 0.75, fig = fig, ax = axs[2])
-    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, prop = 'd_median', lw = 0.75, minprop = 0, maxprop = 5e-4, cmap = 'inferno', fig = fig, ax = axs[3])
+    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, label = 'K', prop = 'flux_density', lw = 0.75, cmap = 'inferno', minprop= 0, maxprop = 1e-4, fig = fig, ax = axs[0])
+    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, label = 'jam status', prop = 'jammed', lw = 0.75, cmap = 'inferno', minprop= 0.0, maxprop = 1.0, fig = fig, ax = axs[1])
+    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, label = '$h_s$', prop = 'till_thickness', lw = 0.75, cmap = 'inferno', minprop= 0.0, maxprop = 0.75, fig = fig, ax = axs[2])
+    PlotNetworkEdgeProp(Network, SubNetworks = SubNet, label = '$d_50$', prop = 'd_median', lw = 0.75, minprop = 0, maxprop = 5e-4, cmap = 'inferno', fig = fig, ax = axs[3])
 
 #%% Read in pickle files and remake subgraphs. 
 #overall graph (required)
@@ -94,10 +96,10 @@ with open('FinalNetwork_SHMIP_'+InputModel+'.pickle','rb') as file:
 #level 0 sub-graph (required)    
 with open('SubNetwork_SHMIP_'+InputModel+'.pickle','rb') as file:
     SubNetCopy = pickle.load(file)
-#L1 and L2 subgraphs (rquird her but not in general)
-with open('BC0.0Network_SHMIP_'+InputModel+'.pickle','rb') as file:
+#L1 and L2 subgraphs (required here but not in general)
+with open('EBC0Network_SHMIP_'+InputModel+'.pickle','rb') as file:
     EBC0Copy = pickle.load(file)
-with open('BC0.005Network_SHMIP_'+InputModel+'.pickle','rb') as file:
+with open('EBCMinNetwork_SHMIP_'+InputModel+'.pickle','rb') as file:
     EBCMinCentCopy = pickle.load(file)
 
 #We need to remake subgraphs so they are views of main Network
@@ -116,7 +118,6 @@ Out_node_coords = [e["coords"] for u,e in SubNet.nodes(data=True) if u in(Out_no
 
 #Make a subgraph involving just the output nodes
 OutNet = nx.subgraph(Network,Out_nodes)
-#%% Initialise the model parameters
 #some typical parameters for erosion definition, for reference
 #K = 2.7e-7  # preexponent for m/a (Herman et al., 2015)
 #L = 2.02  # dimensionless (Herman et al., 2015)
@@ -138,6 +139,21 @@ OutGS = [[0.0],[0.0],[0.0]]
 #detrital properties
 OutDet = [[0.0],[{'init':0.0}],[0.0]]
 
+#make the random number array of n samples for every edge every timesteps
+rng = np.random.default_rng()
+
+# Generate random number arrays for edges at each subgraph level and pickle for later runs...
+# We set up a series of 14 days always the same, after which we draw random slices and shuffle
+RNarray0 = rng.lognormal(size = (14*2+3,SubNet.number_of_edges(),samp_n))
+RNarray1 = rng.lognormal(size = (14*3+1,EBC0.number_of_edges(),samp_n))
+RNarray2 = rng.lognormal(size = (14*3+1,EBCMinCent.number_of_edges(),samp_n))
+
+#Generate graticule property if detritus is bedrock property
+if DetMode == 'NodeProp':
+    Basement = Graticule_Attribute(Network, num_x = 5, num_y = 3)
+    Basement_n = {key: float(Basement[key]) for key in Basement}
+    nx.set_node_attributes(Network,Basement_n,'detritus_prop')
+
 #%%instantiate the sugset model(s) for L0, L1 and L2. Excepting the subgraph these are the same but need not be.
 #L0
 sgst0 = SGST(SubNet,
@@ -155,7 +171,7 @@ sgst0 = SGST(SubNet,
             Dsig = Dsig, #m^-1
             K = K,
             L = L,
-            #W = W,
+            RNarray= RNarray0
             )
 
 #L1
@@ -174,7 +190,7 @@ sgst1 = SGST(EBC0,
             Dsig = Dsig, #m^-1
             K = K,
             L = L,
-            #W = W,
+            RNarray= RNarray1
             )
 
 #L2
@@ -183,7 +199,7 @@ sgst2 = SGST(EBCMinCent,
             cflux_method = "FluxArea",
             erosion_method = "Vel",
             transport_method="EngelundHansen",
-            detritus_method="SedErod",
+            detritus_method=DetMode,
             MaxTillH=MaxTillH,
             InitTillH = InitTillH,
             meanD = meanD, #m
@@ -193,18 +209,19 @@ sgst2 = SGST(EBCMinCent,
             Dsig = Dsig, #m^-1
             K = K,
             L = L,
-            #W = W
+            RNarray= RNarray2
             )
 
 #%%initialise a stady state model for each
 sgst0.initialise_steady()
 sgst1.initialise_steady()
 sgst2.initialise_steady()
-#%% run once at L0 to make sure everything is the same time and has all variables - this saves some time
+
+#%% run for one second at L0 to make sure everything is the same time and has all variables - this saves some time
 t += 1 #just one second
 sgst0.run_one_step_steady(t)
 
-#Make the figure for the initial network
+#Make a figure for the initial network
 MakeFig(Network,SubNet)
 fn = os.path.join(OutputDir,'model_initial.png')
 plt.savefig(fn)
@@ -216,7 +233,7 @@ times = []
 for timestep in range(0, num_timesteps, 1):
     for i in range(0,7):
         #L0 to begin every day - nominally 12AM
-        t += dt/2
+        t += dt
         sgst0.run_one_step_steady(t)
         TrackVol(t,OutNet,OutVol, prop = 'VSo')
         TrackConc(t,OutNet,OutConc, VWprop = 'VW',VSprop = 'VSo')
@@ -226,7 +243,7 @@ for timestep in range(0, num_timesteps, 1):
         #three cycles of L1 and L2
         for j in range (1,4):
             #once on L1
-            t += dt/2
+            t += dt
             sgst1.run_one_step_steady(t)
             TrackVol(t,OutNet,OutVol, prop = 'VSo')
             TrackConc(t,OutNet,OutConc, VWprop = 'VW',VSprop = 'VSo')
@@ -234,7 +251,7 @@ for timestep in range(0, num_timesteps, 1):
             TrackDet(t,OutNet, OutDet, Dprop = 'detritus_node')
             times.append(t)
             #once on L2
-            t += dt/2
+            t += dt
             sgst2.run_one_step_steady(t)
             TrackVol(t,OutNet,OutVol, prop = 'VSo')
             TrackConc(t,OutNet,OutConc, VWprop = 'VW',VSprop = 'VSo')
@@ -242,7 +259,7 @@ for timestep in range(0, num_timesteps, 1):
             TrackDet(t,OutNet, OutDet, Dprop = 'detritus_node')
             times.append(t)
         #L0 to end every day - nominally 9PM
-        t += dt/2
+        t += dt
         sgst0.run_one_step_steady(t)
         TrackVol(t,OutNet,OutVol, prop = 'VSo')
         TrackConc(t,OutNet,OutConc, VWprop = 'VW',VSprop = 'VSo')
@@ -255,9 +272,6 @@ for timestep in range(0, num_timesteps, 1):
     plt.savefig(fn)
     plt.close()
 
-#run L0 network one final time to ensure all network is at same time
-t += dt
-sgst0.run_one_step_steady(t)
 #%% write out results to file
 
 #report out the output arrays 
@@ -322,17 +336,45 @@ fn = os.path.join(OutputDir,'OutGS.png')
 plt.savefig(fn, dpi = 300)
 plt.close()
 
-# and of cumulative volume flux by source
-PlotOrder = [0,1,2]
-DetClasses = ['init','basal','basement']
-col = ['gray','lightyellow','lightsalmon']
-DetVolArray = np.zeros(shape = (len(PlotOrder),len(times)))
-for i,j in enumerate(OutDet[2][1:]):
-    VScale = OutVol[3][i]
-    for m,n in enumerate(PlotOrder):
-        DetVolArray[m][i] = DetVolArray[m][i-1]+j[n] * VScale
-plt.stackplot(times,DetVolArray, labels = DetClasses, colors = col)
-plt.legend(fontsize = 'x-small', ncol=6, loc = 'upper left')
-fn = os.path.join(OutputDir,'OutDetVol.png')
-plt.savefig(fn, dpi = 300)
-plt.close()
+
+#and of cumulative volume flux by source
+#plotting if we do not have bedrock detritus enabled
+def MakeFig(OutDets,OutVols):
+    fig,axs = plt.subplots(figsize = (6,4.5), dpi = 300)
+    DetClasses = ['init','basal','basement']
+    PlotOrder = [0,1,2]
+    col = ['gray','lightyellow','lightsalmon']
+    DetVolArray = np.zeros(shape = (len(DetClasses),len(OutDets[0])-1))
+    Otimes = [n for n in OutVols[0][1:]]
+    for i,j in enumerate(OutDets[2][1:]):
+        VScale = OutVols[3][i]
+        for m,n in enumerate(PlotOrder):
+            key = DetClasses[m]
+            DetVolArray[m][i] = DetVolArray[m][i-1]+j[key] * VScale
+    axs.stackplot(Otimes,DetVolArray, labels = DetClasses, colors = col)
+    axs.legend(fontsize = 'x-small', ncol = 3, loc = 'upper left')
+
+#plotting function if we have detritus enabled
+def MakeFigD(OutDets,OutVols):
+    fig,axs = plt.subplots(figsize = (6,4.5), dpi = 300)
+    DetClasses= ['init','basal',0.0,1.0,2.0,10.0,11.0,12.0,20.0,21.0,22.0,30.0,31.0,32.0,40.0,41.0,42.0]
+    col = ['gray','lightyellow','lightsalmon','salmon','darksalmon','lightgreen','limegreen','lime','skyblue','deepskyblue','steelblue','mediumslateblue','slateblue','darkslateblue','thistle','violet','darkviolet']
+    PlotOrder = [0,1,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2]
+    DetVolArray = np.zeros(shape = (len(DetClasses),len(OutDets[0])-1))
+    Otimes = [n for n in OutVols[0][1:]]
+    for i,j in enumerate(OutDets[2][1:]):
+        VScale = OutVols[3][i]#/OutVols[4][-1]
+        for m,n in enumerate(PlotOrder):
+            key = DetClasses[m]
+            DetVolArray[m][i] = DetVolArray[m][i-1]+j[key] * VScale
+    axs.stackplot(Otimes,DetVolArray, labels = DetClasses, colors = col)
+    axs.legend(fontsize = 'x-small', ncol = 3, loc = 'upper left')
+
+if DetMode == 'NodeProp':
+    MakeFigD(OutDet,OutVol)
+    fn = os.path.join(OutputDir,'OutDetVol.png')
+    plt.savefig(fn,dpi = 300)
+else:
+    MakeFig(OutDet,OutVol)
+    fn = os.path.join(OutputDir,'OutDetVol.png')
+    plt.savefig(fn,dpi = 300)

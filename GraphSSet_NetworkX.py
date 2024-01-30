@@ -55,13 +55,13 @@ class SubglacialErosionandSedimentFlux():
         g=9.81, #m/s^2
         fluid_density=1000.0, #kg/m^3
         ice_density = 920.0, #kg/m^3
-        HookeAngle=30, #degrees
+        HookeAngle=180, #degrees -- 'pi' is a semi-circle appropriate for GlaDS
         DarchWeisbachFrictionFactor=0.15,
         Herodelim = 0.75, #m
         MaxTillH=1.0, #m
         InitTillH = 0.00, #m
-        SedimentUptakelength = 100.0, #m
-        Dsig = 1000.0, #m^-1
+        SedimentUptakeLength = None, #m #default is to use edge length
+        Dsig = 1e-3, #m
         Dhmin = 0.21, #m
         meanD = 2.2e-4, #m
         stdD = 1.5, # in ln(D) space
@@ -70,6 +70,7 @@ class SubglacialErosionandSedimentFlux():
         L = 1,
         W = 2e-10,
         samp_n = 100,
+        RNarray = None
     ):
         if not isinstance(graph,nx.classes.digraph.DiGraph):
             msg = "SubglacialErosionandSedimentTransporter: graph must be a networkx directed graph but is {}".format(type(graph))
@@ -93,7 +94,7 @@ class SubglacialErosionandSedimentFlux():
         self._fr = DarchWeisbachFrictionFactor
         self._Hg = Herodelim
         self._Hlim = MaxTillH
-        self._sedl = SedimentUptakelength
+        self._sedl = SedimentUptakeLength
         self._InitTill = InitTillH
         self._Dsig = Dsig
         self._dhmin = Dhmin
@@ -105,6 +106,7 @@ class SubglacialErosionandSedimentFlux():
         self._l = L
         self._w = W
         self._samp_n = samp_n
+        self._RNarray = RNarray
         
         #check the potential gradient method is valid
         if potgrad_method in _SUPPORTED_POTGRAD_METHODS:
@@ -168,7 +170,11 @@ class SubglacialErosionandSedimentFlux():
         else:
             msg('no way to determine edge length - requires either attribute "length" or coords as [[X0,Y0],[X1,Y1]]')
             raise ValueError(msg)        
-            
+        
+        if self._sedl is None:
+            self._sedl = self._length
+        
+        
     @property
     def time(self):
         """Return current timestep time."""
@@ -193,17 +199,18 @@ class SubglacialErosionandSedimentFlux():
             a = nx.get_edge_attributes(self._graph,'d_median')
             self._d_median = np.array([a[key] for key in a])
             if 'd_distribution' in self._edge_attributes:
-                a = nx.get_edge_attributes(self._graph,'d_distribution')
-                self._d_dist = [a[key] for key in a]
+                b = nx.get_edge_attributes(self._graph,'d_distribution')
+                self._d_dist = [b[key] for key in b]
             else: 
-                #we assume that log(mean) == log(median) and that sigma is as input
-                self._d_dist = [(np.log(a[key]),self._stdD) for key in a]
-        else: #randomly define new values using a log normal distribution
+                #else we assume the default distribution
+                self._d_dist = [(np.log(self._meanD),self._stdD) for key in a]
+        else: #define new values using a log normal distribution
             newDs = [NewDdist(self._meanD, self._stdD, self._samp_n) for i in self._edge_keys]
             self._d_median = np.array([i[0] for i in newDs])
             values = {(u,v): self._d_median[i] for i,(u,v) in enumerate(self._edge_keys)}
             nx.set_edge_attributes(self._graph,values, 'd_median')
             self._d_dist = [i[1] for i in newDs]
+            #self._d_dist = [(np.log(self._meanD),self._stdD) for key in a]
             values = {(u,v): self._d_dist[i] for i,(u,v) in enumerate(self._edge_keys)}
             nx.set_edge_attributes(self._graph,values, 'd_distribution')
         if 'sed_d_distribution' in self._edge_attributes:
@@ -462,12 +469,14 @@ class SubglacialErosionandSedimentFlux():
         mob = (self._QSc-self._QSin)/self._sedl
         
         #sigmaH eq is incorrect in Delaney et al 2019 paper -- multiply by 5 (not divide) gives the correct form
-        #see also Delaney et al, 2023 for this formulation (but with m not m^-1)
-        sigmaH = (1+np.exp((2-self._Dsig*TTedge)*5))**-1
+        #see Delaney et al, 2023 for this formulation (with m not m^-1)
+        sigmaH = (1+np.exp(10-5*TTedge/self._Dsig))**-1
         
         #conditional for till source term (eq 15 of Delaney) - new eroded sediment is from bedrock only; 
         #bedrock porosity is assumed zero
         self._mt = np.where(TTedge >= self._Hg, 0.0,self._erod*(self._Hg-TTedge))*self._edgewidth
+        #newer formulation to include in next update
+        #self._mt = self._erod*(1-(TTedge/self._Hg))*self._edgewidth
         
         #maximum till available to mobilise from new erosion and existing till
         #here we include porosity as we want a volume of grain only not pores
@@ -517,6 +526,20 @@ class SubglacialErosionandSedimentFlux():
         else:
             k = np.zeros_like(self._length)
         
+        #draw a slice from random number array, if it exists, otherwise make an array
+        rng = np.random.default_rng()
+        if self._RNarray is not None:
+            # for the length of the input array we draw them in series
+            if self._time_idx < len(self._RNarray):
+                RNA = self._RNarray[self._time_idx] #num_edges by n
+            else:
+                #and for any subsequent we draw a slice randomly from the array and shuffle it
+                idx = rng.integers(low = 0, high = len(self._RNarray))
+                RNA = self._RNarray[idx] #num_edges by n
+                rng.shuffle(RNA, axis = 0)
+        else:
+            RNA = rng.lognormal(size = (self._graph.number_of_edges(),self._samp_n))
+        
         #we define the distance possible to travel in time dt using the virtual velocity
         # for Engelund & Hansen we may find that QS > 0 but Uv is not > 0.
         # so as to avoid gridlock we use lmin to control this
@@ -530,6 +553,7 @@ class SubglacialErosionandSedimentFlux():
         
         #xcrit is the point from which material downstream can exit the edge
         xcrit = np.where(l>self._length, self._length,l)
+        #instead we might want to adaptively shorten the timestep to avoid this limitation
         
         # maximum flux density is the flux capacity * dt over the length of link
         kmax = self._QSc*self._dt/self._length
@@ -612,7 +636,7 @@ class SubglacialErosionandSedimentFlux():
                     else: 
                         dists.append((np.log(self._d_median), self._stdD))
             VStoNode[t]=np.sum(vols)
-            d_dists[t] = CombineDdists(dists,vols,self._samp_n,def_mean = self._meanD, def_std = self._stdD)[1]
+            d_dists[t] = CombineDdistsArray(dists,vols,RArray = RNA[t],def_mean = self._meanD, def_std = self._stdD)[1]
             for key in self._graph.succ[u]:
                 if self._graph.succ[u][key]['status'] != 0: #no constraint from outlet segments
                     qc = self._graph.succ[u][key]['VScap']
@@ -691,7 +715,7 @@ class SubglacialErosionandSedimentFlux():
         
         #Now recalculate the grain size distribution for edges given the volumes in and out and residual sediment
         
-        #new samples of global distribution with sampl size n_samp
+        #new samples of global distribution with sample size n_samp
         newDs = [NewDdist(self._meanD, self._stdD, self._samp_n)[1] for i in self._edge_keys]
         #input distributions from nodes
         d_dist_in = [d_dist_node[u] for i,(u,v) in enumerate(self._edge_keys)]
@@ -699,17 +723,25 @@ class SubglacialErosionandSedimentFlux():
         #volumetric proportions defind using function MixVols
         self._PVolArrays = MixVols(self._VolArrays)
         P_as_edge = self._PVolArrays[0]
+        a = {(u,v): P_as_edge[i] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(self._graph,a,'pV_edge')
         P_as_node = self._PVolArrays[1]
+        a = {(u,v): P_as_node[i] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(self._graph,a,'pV_node')
         P_basal = self._PVolArrays[2]
+        a = {(u,v): P_basal[i] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(self._graph,a,'p_sed')
         P_basement = self._PVolArrays[3]
+        a = {(u,v): P_basement[i] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(self._graph,a,'p_base')
         
         #volume proportions for each volume element
         volPs = [[P_as_edge[i],P_as_node[i],P_basal[i],P_basement[i]] for i,j in enumerate(self._edge_keys)]
         #dist for each volume element
         dists = [[self._d_dist[i],d_dist_in[i],self._sed_d_dist[i], newDs[i]] for i,j in enumerate(self._edge_keys)]
-        
         #get new edge distributions with function CombineDdists
-        newdists = [CombineDdists(dists[i],volPs[i],self._samp_n, def_mean = self._meanD, def_std = self._stdD) for i,j in enumerate(self._edge_keys)]
+        newdists = [CombineDdistsArray(dists[i],volPs[i],RArray = RNA[i],def_mean = self._meanD, def_std = self._stdD) for i,j in enumerate(self._edge_keys)]
+        
         #output new distributions to graph
         a = {(u,v): newdists[i][0] for i,(u,v) in enumerate(self._edge_keys)}
         nx.set_edge_attributes(self._graph,a,'d_median')
@@ -727,7 +759,7 @@ class SubglacialErosionandSedimentFlux():
         Pdep = np.where(np.isfinite(VSdep/(VT+VSdep)),VSdep/(VT+VSdep),0.0)
         volPs = [[Pdep[i],1-Pdep[i]] for i,j in enumerate(self._edge_keys)]
         dists = [[self._d_dist[i], self._sed_d_dist[i]] for i,j in enumerate(self._edge_keys)]
-        newdists = [CombineDdists(dists[i],volPs[i],self._samp_n) for i,j in enumerate(self._edge_keys)]
+        newdists = [CombineDdistsArray(dists[i],volPs[i],RArray = RNA[i],def_mean = self._meanD, def_std = self._stdD) for i,j in enumerate(self._edge_keys)]
         
         #report to graph
         a = {(u,v): newdists[i][0] for i,(u,v) in enumerate(self._edge_keys)}
@@ -997,8 +1029,6 @@ class SubglacialErosionandSedimentFlux():
                         
             #report this back to the graph
             nx.set_node_attributes(self._graph,det_node, 'detritus_node')
-            
-            
 
     def _update_time(self,time):
         self._time = time
@@ -1076,7 +1106,6 @@ class SubglacialErosionandSedimentFlux():
 
 #### Helper Methods called in the preceding methods ####
 
-#New methods
 def SHREVE_potential(s,b,ri=920.0,rw=1000.0,g=9.81,k=1.0, s_isThick = False):
     """method to calculate hydraulic potential in Pa with equation of Shreve"""
     if k > 1.0:
@@ -1209,9 +1238,9 @@ def NewDdist(mean,sigma,n):
     """method to draw a sample from a distribution"""
     mu = np.log(mean)
     rng = np.random.default_rng()
-    D_arr = rng.lognormal(mu,sigma,n)
-    median = np.median(D_arr)
-    dist = (np.mean(np.log(D_arr)),np.std(np.log(D_arr)))
+    D_arr = np.log(rng.lognormal(mu,sigma,n))
+    median = np.exp(np.nanmedian(D_arr))
+    dist = (np.nanmean(D_arr),np.nanstd(D_arr))
     return median,dist
 
 def CombineDdists(dists,vPs,n, def_mean = 0, def_std = 1):
@@ -1232,5 +1261,40 @@ def CombineDdists(dists,vPs,n, def_mean = 0, def_std = 1):
     else:
         D_arr = rng.lognormal(np.log(def_mean),def_std,n)
     median = np.median(D_arr)
-    dist = (np.mean(np.log(D_arr)),np.std(np.log(D_arr)))
+    dist = (np.nanmean(np.log(D_arr)),np.nanstd(np.log(D_arr)))
+    return median,dist
+
+def CombineDdistsArray(Ddists, DvPs, RArray = None, n = None, def_mean = 0, def_std = 1):
+    """method to combine several distribution samples by volume"""
+    if RArray is not None:
+        RandArray = np.log(RArray)
+        n = len(RandArray)
+    elif n is not None:
+        #make a 1D array of random numbers
+        rng = np.random.default_rng()
+        RandArray = np.log(rng.lognormal(size = n))
+    else:
+        raise ValueError('Both RArray and samp_n are None, you must provide one of these')
+    #get the number of elements for each volume input
+    n_els = np.array([np.rint(i*n) for i in DvPs])
+    #if there are not NaN issues, we can continue
+    if np.nansum(n_els) > n-len(DvPs):
+        begins = [int(np.nansum(n_els[:i])) for i,j in enumerate(n_els)]
+        ends = [int(np.nansum(n_els[:i+1])) for i,j in enumerate(n_els)]
+        #initialise an array for mu
+        MuArray = np.ones(n)*np.log(def_mean)
+        #and sigma
+        SigArray = np.zeros(n)*def_std
+        #Get each shift and scale from Ddists if both are finite
+        for i, j in enumerate(Ddists):
+            if np.isfinite(j[0]) and np.isfinite(j[1]):
+                MuArray[begins[i]:ends[i]] = j[0] 
+                SigArray[begins[i]:ends[i]] = j[1]
+        #shift and scale RandArray
+        DArray = RandArray*SigArray+MuArray
+        median = np.exp(np.nanmedian(DArray))
+        dist = (np.nanmean(DArray),np.nanstd(DArray))
+    else:
+        median = def_mean
+        dist = (np.log(def_mean),def_std)
     return median,dist
