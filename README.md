@@ -44,10 +44,15 @@ Getting Started:
 First ensure your python distribution is reasonably up to date with the following modules installed:
 
 numpy and scipy - required for doing the calculations
+
 networkx - required for graph management
+
 ray - required to manage parallelisation
+
 mat73 - required for loading the matlab files.
+
 matplotlib - required for imaging 
+
 pickle - required for storing model outputs and reading inputs
 
 To run a model from the included hydrology set, there are two steps:
@@ -55,6 +60,7 @@ To run a model from the included hydrology set, there are two steps:
 STEP 1:
 
 To generate a NetworkX representation of an input hydrology model use the script SHMIP_graph_ABseries.py (or SHMIP_graph_CDseries.py). The script should run interactively in your favourite IDE (it was made and tested in Spyder).
+
     >>  The output will be a set of pickle files each containing a graph (or subgraph) plus any plots that you choose to save
 
 STEP 2: 
@@ -72,15 +78,20 @@ More customised images of the output data can be generated using the functions i
 
 If you want to change the duration, subsampling rate, or any other variables/parameters for models - go for it. Most things should work if you don't do something silly.
 
+---------------------------------------------------------------------------------------------------------------------------------
+
 Running a model with your own hydrology input:
 
 If you have an 'original' GlaDS matlab output (as.mat) you should be able to run this as above, with changes to whatever parameters you want. See comments in ReadGladsMat.py
 
 If you have an ISSM GlaDS model output (as.nc and/or.mat) you can use the Read_ISSM_nc.py and/or read ISSM_mat.py.
+
     >> Multi level structs in the .mat format will not be read into python with the .mat reader(s) so it is recommended to export to NetCDF using the ISSM NetCDF export functionality
+
     >> These scripts are not tested across all possible ISSM outputs, so you may need to improvise, please contact Alan Aitken if you need help.
 
 If you have a VTU format (e.g. from Elmer-Ice) you can use the ReadVTU.py script. 
+
     >> This script is not tested across all possible Elmer-Ice outputs, so you may need to improvise, please contact Alan Aitken if you need help.
 
 If you have another hydrology model output GraphSSeT can probably handle it, as long as you can 
