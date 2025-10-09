@@ -7,11 +7,15 @@ Created on Tue Jan 17 19:33:21 2023
 import numpy as np
 import networkx as nx
 from networkx.algorithms import community
+import heapq
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import ScalarFormatter
+import matplotlib
 from operator import itemgetter
 import itertools
+from scipy.optimize import leastsq
+import string
 
 #path analysis
 
@@ -130,6 +134,45 @@ def Dijkstra_SubNetSometoSomeNShortest(Network,InNodes,OutNodes, n, Weight = Non
 
 #community mapping - identify 'catchment' structure
 
+import networkx as nx
+
+def ClosestTargetNode(Network, source_nodes, target_nodes, weight='weight'):
+    #this function from ChatGPT and then I got involved...aka do not trust!
+    # Step 1: Reverse the graph
+    Krowten = Network.reverse()
+
+    # Step 2: Multi-source Dijkstra from all targets in reversed graph
+    # min-heap priority queue
+    heap = [(0, t) for t in target_nodes]
+    heapq.heapify(heap)
+    dist = {}          # node -> distance to nearest target
+    closest_target = {}  # node -> closest target
+
+    while heap:
+        d, u = heapq.heappop(heap)
+        if u in dist:
+            continue  # already visited with shorter path
+        dist[u] = d
+
+        # Find which target it came from
+        if u in target_nodes:
+            closest_target[u] = u
+        for v in Krowten[u]:
+            edge_weight = Krowten[u][v].get(weight, 1)
+            if v not in dist:
+                heapq.heappush(heap, (d + edge_weight, v))
+                # Propagate the identity of the closest target
+                closest_target[v] = closest_target.get(u, u)
+
+    # Step 3: For each source, return closest target and distance
+    result = {}
+    for s in source_nodes:
+        if s in dist:
+            result[s] = (closest_target[s], dist[s])
+        else:
+            result[s] = (None, float('inf'))  # unreachable
+    return result
+
 def GreedyModularityN(Network, resolution = 1, weight = None, cutoff = 1, best_n = 1):
     c = community.greedy_modularity_communities(Network,resolution = resolution, weight = weight, cutoff = cutoff, best_n = best_n)
     d = [set(j) for i,j in enumerate(c)]
@@ -238,9 +281,9 @@ def SomeNodeBetweennessCentrality(Network, sources, targets, weight = None, thre
     c = nx.betweenness_centrality_subset(Network, sources, targets, weight = weight)
     return c
 
-def SomeEdgeBetweennessCentrality(Network, sources, targets, weight = None, threshold = None, Norm = True):
-    c = nx.edge_betweenness_centrality_subset(Network, sources, targets, weight = weight)
-    if Norm:
+def SomeEdgeBetweennessCentrality(Network, sources, targets, weight = None, threshold = None, norm = True):
+    c = nx.edge_betweenness_centrality_subset(Network, sources, targets, weight = weight, normalized = norm)
+    if norm:
         NF = len(sources)*(len(targets)-1)
         c = {j:c[j]/NF for i,j in enumerate(c)}
     nx.set_edge_attributes(Network, c, "betweenness_sub")
@@ -289,29 +332,30 @@ def Randomise_Node_Attribute(Network, prop = 'weight', var_prop = None, allow_ze
     #nx.set_node_attributes(Network, new_data, prop)
     return new_data
 
-def Graticule_Attribute(Network, coords = 'coords', num_x = 5, num_y = 5, prop = None, null = '-99'):
+def Cart_Graticule_Attribute(Network, coords = 'coords', num_x = 5, num_y = 5, prop = None, null = '-99'):
     locs = nx.get_node_attributes(Network, coords)
     x_coords = np.array([locs[key][0] for key in locs])
     x_class = np.array([null]*len(x_coords))
     min_x = np.nanmin(x_coords)
     max_x =np.nanmax(x_coords)
     dx = (max_x - min_x)/num_x
+    print('dx is {}'.format(dx))
     y_coords = np.array([locs[key][1] for key in locs])
     y_class = np.array([null]*len(y_coords))
     min_y = np.nanmin(y_coords)
     max_y =np.nanmax(y_coords)
     dy = (max_y - min_y)/num_y
-    
+    print('dy is {}'.format(dy))
     for i in range(0,num_y):
         for m,n in enumerate(y_coords):
-            if n>=dy*i and n<dy*(i+1):
+            if n>=min_y+dy*i and n<min_y+dy*(i+1):
                 y_class[m] = str(i)
             elif i == num_y-1 and n == max_y:
                 y_class[m] = str(i)
                 
     for i in range(0,num_x):
         for m,n in enumerate(x_coords):
-            if n>=dx*i and n<dx*(i+1):
+            if n>=min_x+dx*i and n<min_x+dx*(i+1):
                 x_class[m] = str(i)
             elif i == num_x-1 and n == max_x:
                 x_class[m] = str(i)
@@ -319,6 +363,120 @@ def Graticule_Attribute(Network, coords = 'coords', num_x = 5, num_y = 5, prop =
     GratClass =  [x_class[i] + y_class[i] for i,j in enumerate(x_class)]
     new_data = {key: GratClass[i] for i,key in enumerate(locs)}
     return new_data
+
+def Radial_Graticule_Attribute(Network, Out_node_coords, zone_width = None, sector_width = None, prop = None, Numeric = True, Inverse = False):
+
+    def getCircle(NodeCoords):
+        xs = [i[0] for i in NodeCoords]
+        ys = [i[1] for i in NodeCoords]
+        def calc_R(xc, yc):
+            """ calculate the distance of each 2D points from the center (xc, yc) """
+            return np.sqrt((xs-xc)**2 + (ys-yc)**2)
+        def f_2(c):
+            """ calculate the algebraic distance between the data points and the mean circle centered at c=(xc, yc) """
+            Ri = calc_R(*c)
+            return Ri - Ri.mean()
+        centre_estimate = np.mean(xs), np.mean(ys)
+        centre_2, ier = leastsq(f_2, centre_estimate)
+        R_2 = np.mean(calc_R(centre_2[0], centre_2[1]))
+        return centre_2,R_2
+
+    CircleFit = getCircle(Out_node_coords)
+
+    def getVector(NodeCoords,Circle):
+        #get middle node, and vector to circle centre -- here we initially assume there is no 'loops', but the check is made
+        mid = np.median(NodeCoords, axis=0)
+        c = Circle[0]
+        azi = np.arctan2(c[1]-mid[1],c[0]-mid[0])
+        return mid,azi
+
+    C_Vector = getVector(Out_node_coords,CircleFit)
+
+    def GetZoneandSector(NodeCoords,C_Vector, zone_width = None, sector_width = None, Inverse = Inverse):
+        origin = C_Vector[0]
+        c_azi = C_Vector[1]
+        if Inverse: # is selected we map instead moving towards a distant point
+            #first where does the line first intersect the model edge
+            min_x = np.nanmin([j[0] for j in NodeCoords])
+            max_x = np.nanmax([j[0] for j in NodeCoords])
+            min_y = np.nanmin([j[1] for j in NodeCoords])
+            max_y = np.nanmax([j[1] for j in NodeCoords])
+            print(min_x,max_x,min_y,max_y)
+            #this is a poor solution but does preserve zone width
+            zw = zone_width
+            In_model = True
+            while In_model:
+                print(zw)
+                x = origin[0]+zw*np.cos(c_azi)
+                y = origin[1]+zw*np.sin(c_azi)
+                if x > min_x and x < max_x and y > min_y and y < max_y:
+                    zw += zone_width
+                else:
+                    In_model = False
+            origin = [x,y]
+            print(origin)
+            #reverse the azimuth
+            if c_azi > 0:
+                c_azi = c_azi - np.pi
+            else:
+                c_azi = c_azi + np.pi
+            print(c_azi)
+        #establish distance and azimuth
+        d = lambda l,o: np.sqrt((l[0]-o[0])**2+(l[1]-o[1])**2)
+        dists = np.array([d(j,origin) for j in NodeCoords])
+        a = lambda l,o: np.arctan2(l[1]-o[1],l[0]-o[0])
+        azis = np.array([a(j,origin) for j in NodeCoords])-c_azi
+        
+        #identify the zones
+        if zone_width == None:
+            zone_width = np.max(dists)/20
+        n_zones = int(np.max(dists)//zone_width)+1
+        min_d = 0.
+        max_d = zone_width
+        zones = np.zeros_like(dists)
+        for zone in range (1,n_zones+1):
+            zones = np.where(np.logical_and(dists<max_d,dists>=min_d),zone,zones)
+            min_d += zone_width
+            max_d += zone_width
+        
+        #identify the sectors
+        n_sectors = int((np.max(azis)-np.min(azis))//sector_width)+1
+        if sector_width == None:
+            sector_width = (np.max(azis)-np.min(azis))/4 
+        min_azi = 0.
+        max_azi = sector_width
+        sectors = np.zeros_like(azis)
+        for sector in range(1,n_sectors+1):
+            #here we have plus and minus azi
+            sectors = np.where(np.logical_and(azis<max_azi,azis>=min_azi),sector,sectors)
+            sectors = np.where(np.logical_and(azis>-max_azi,azis<=-min_azi),-sector,sectors)
+            max_azi += sector_width
+            min_azi += sector_width
+        return dists, azis, zones, sectors
+
+    All_Nodes_coords = [e["coords"] for u,e in Network.nodes(data=True)]
+
+    Dists, Azis, Zones, Sectors = GetZoneandSector(All_Nodes_coords,C_Vector, zone_width = zone_width, sector_width = sector_width)
+
+    #sectors as letters
+    if not Numeric:
+        NewSectors = Sectors.copy()
+        n_to_alpha = {x: y for x,y in enumerate(string.ascii_lowercase, 1)}
+        vals = np.unique(Sectors)
+        for val in vals:
+            if val < 0 and val > -27:
+               v = n_to_alpha[-val]+n_to_alpha[-val]
+            elif val > 0 and val < 27:
+                v = n_to_alpha[val] + '_'
+            else:
+                v = '__'
+            NewSectors = np.where(Sectors == val,v,NewSectors)
+        GratClass =  [str(j)+str(int(Zones[i])) for i,j in enumerate(NewSectors)]    
+    else:
+        GratClass =  [float(str(j)[:-1]+str(int(Zones[i]))) for i,j in enumerate(Sectors)]
+    new_data = {node: GratClass[i] for i,node in enumerate(Network.nodes)}
+    return new_data
+
 
 #data access
 
@@ -346,9 +504,87 @@ def NetworkNodestoArr(Network, prop = 'weight', index = None):
             nodes[m][prop] = Network.nodes[n][prop][index]
     return nodes
 
-#plotting
+# filtering
 
-def PlotSubNetworksEdges(Network, SubNetworks, lw = None, ordered = True, legend = True):
+def NetworkEdgeFilter(Network, prop = 'weight', n_passes = 1):
+    #get preds for each node
+    P = {node: 0.0 for node in Network.nodes()}
+    for u in Network.nodes():
+        n = len(Network.pred[u])
+        if n > 0:
+            for key in Network.pred[u]:
+                v = Network.pred[u][key][prop]/n
+                if np.all(np.isnan(v)):
+                    P[u] += 0
+                else:
+                    P[u] += v
+        else:
+            P[u]= np.nan
+    
+    #get succs for each node
+    S = {node: 0.0 for node in Network.nodes()}
+    for u in Network.nodes():
+        n = len(Network.succ[u])
+        if n > 0:
+            for key in Network.succ[u]:
+                v = Network.succ[u][key][prop]/n
+                if np.all(np.isnan(v)):
+                    S[u] += 0
+                else:
+                    S[u] += v  
+        else:
+            S[u]= np.nan
+
+    # for each edge get filtered values as the 3 point filter 0.25, 0.5, 0.25
+    E_prop = nx.get_edge_attributes(Network,prop)
+    passes = 0
+    while passes < n_passes:
+        print('filter pass {}'.format(passes))
+        for key in E_prop.keys():
+            p_value = P[key[0]]
+            s_value = S[key[1]]
+            e_value = E_prop[key]
+            if np.all(np.isnan(p_value)):
+                p_value = e_value
+            if np.all(np.isnan(s_value)):
+                s_value = e_value
+            new_e_value = p_value*0.25+e_value*0.5+s_value*0.25
+            E_prop[key] = new_e_value
+        passes += 1
+    return E_prop
+
+def MapEdgePropToNodeProp(Network, edge_prop, node_prop, direction = 'down', mapping = 'sum'):
+    #'function to map edge properties onto nodes...more or less we assume single-value numerical data but some other things might also work'
+    nan_mappings = ['sum', 'max', 'min', 'mean', 'median','std'] # these are basically things that ca have np.nan put in front 
+    mappings = ['unique']#these are those that done take np.nan just np
+    if mapping in nan_mappings:
+        command = 'v = np.nan' + mapping +'(vals)' #we prefer the nan-safe version
+    elif mapping in mappings:
+        command = 'v = np' + mapping +'(vals)' #we prefer the nan-safe version
+    else:    
+        raise ValueError('requested mapping is not available')  
+    if direction == 'down':
+        P = {node: 0.0 for node in Network.nodes()}
+        for u in Network.nodes():
+                vals = []
+                for key in Network.pred[u]:
+                    vals.append(Network.pred[u][key][edge_prop])
+                loc = {'vals':vals}
+                exec(command,globals(),loc)
+                P[u] = loc['v']         
+    elif direction == 'up':
+        P = {node: 0.0 for node in Network.nodes()}
+        for u in Network.nodes():
+                vals = []
+                for key in Network.succ[u]:
+                    vals.append(Network.succ[u][key][edge_prop])
+                loc = {'vals':vals}
+                exec(command,globals(),loc)
+                P[u] = loc['v'] 
+    nx.set_node_attributes(Network,P,node_prop)  
+    
+#plotting
+def PlotSubNetworksEdges(Network, SubNetworks, lw = None, ordered = True, legend = True, cmap = 'tab20'):
     fig,ax = plt.subplots()
     lines = NetworkEdgestoArr(Network)
     #reorder for drawing by property
@@ -359,11 +595,13 @@ def PlotSubNetworksEdges(Network, SubNetworks, lw = None, ordered = True, legend
     lc = LineCollection([e['coords'] for u,e in lines],linewidth=lw, color = 'gray', zorder=1, label = 'main network')
     ax.set_aspect('equal')
     ax.add_collection(lc)
+    cm = matplotlib.colormaps[cmap] 
+    cols = cm(np.linspace(0,1,len(SubNetworks.items())))
     n=0
     if type(SubNetworks) is dict:
         lw += 0.25
         for i,j in SubNetworks.items():
-            col = 'C{}'.format(n)
+            col = cols[n]
             lines = NetworkEdgestoArr(SubNetworks[i])
             #reorder for drawing by property
             if ordered:

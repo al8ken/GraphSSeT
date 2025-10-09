@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri May 26 09:05:35 2023
+Created on Fri Jan 24 09:05:35 2025
 
 @author: Alan Aitken
 """
@@ -209,7 +209,7 @@ def GladstoNetworkX_multi(mesh, min_step = 0, max_step = -1, step_size = 1, weig
     edge_coords = [(node_arr[j[0]-1],node_arr[j[1]-1]) for i, j in enumerate(edge_arr)]
     #get BCs
     BC_nodes, BC_edges = getBCs(mesh)
-    #get moulin input
+    #get moulin input - seems to be a constant here
     scale = getScale(mesh,'source_term_c')
     moulin_flux = getNodeProp(mesh,'source_c')*scale
     
@@ -232,7 +232,7 @@ def GladstoNetworkX_multi(mesh, min_step = 0, max_step = -1, step_size = 1, weig
     edge_status = np.ones_like(edge_phi_grad)
     for n,m in enumerate(edge_status):
         for i,j in enumerate(edge_arr):
-            #identify if both nodes are 'floating' (flag = -1)
+            #identify if both nodes are floating (flag = -1)
             if edge_phi[n][i][0] == 0.0 and edge_phi[n][i][1]== 0.0:
                 edge_status[n][i] = -1
             elif edge_phi[n][i][0] == 0.0 or edge_phi[n][i][1]== 0.0:
