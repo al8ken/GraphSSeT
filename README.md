@@ -1,5 +1,5 @@
 # GraphSSeT
-Code and model inputs to run graph-based subglacial sediment transport from SHMIP hydrology models
+Code and model inputs to run graph-based subglacial sediment transport from Subglacial hydrology models
 
 Input Data (for examples):
 
@@ -43,17 +43,12 @@ Getting Started:
 
 First ensure your python distribution is reasonably up to date with the following modules installed:
 
-numpy and scipy - required for doing the calculations
-
-networkx - required for graph management
-
-ray - required to manage parallelisation
-
-mat73 - required for loading the matlab files.
-
-matplotlib - required for imaging 
-
-pickle - required for storing model outputs and reading inputs
+    >>  numpy and scipy - required for doing the calculations
+    >>  networkx - required for graph management
+    >>  ray - required to manage parallelisation
+    >>  mat73 - required for loading the matlab files.
+    >>  matplotlib - required for imaging 
+    >>  pickle - required for storing model outputs and reading inputs
 
 To run a model from the included hydrology set, there are two steps:
 
