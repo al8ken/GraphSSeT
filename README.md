@@ -3,12 +3,8 @@ Code and model inputs to run graph-based subglacial sediment transport from SHMI
 
 Input Data (for examples):
 Input data are the matlab output files (.mat) from running SHMIP models in GlaDS
-Input data for series A and B models are in the folder InputData
-<<<<<<< Updated upstream
-Input data for series C models are in the associated zenodo repository (https://zenodo.org/doi/10.5281/zenodo.12570096)
-=======
-Input data for series C models are in the associated zenodo repository (https://doi.org/10.5281/zenodo.12570096)
->>>>>>> Stashed changes
+Input data for series A and B models are in the directory InputData
+Input data for series C and D models are in the associated zenodo repository (https://doi.org/10.5281/zenodo.12570096)
 
 Model Scripts: 
 
@@ -91,11 +87,8 @@ If you have only an ice-sheet model - see the above requirements to define - als
 
 ---------------------------------------------------------------------------------------------------------------------------------
 
-<<<<<<< Updated upstream
-Please don't forget to cite/acknowledge this GitHub repository, the associated zenodo repository(https://zenodo.org/doi/10.5281/zenodo.12570096) and the paper(Aitken, A. R. A., Delaney, I. A., Pirot, G., and Werder, M.: Modelling subglacial fluvial sediment transport with a graph-based model, GraphSSeT, EGUsphere [preprint], https://doi.org/10.5194/egusphere-2024-274, 2024.).
-=======
 Please don't forget to cite/acknowledge this GitHub repository, the associated zenodo repository(https://doi.org/10.5281/zenodo.12570096) and the paper(https://doi.org/10.5194/tc-18-4111-2024).
->>>>>>> Stashed changes
+
 Any questions or problems can be directed to Alan Aitken (alan.aitken@uwa.edu.au)
 
 Happy modelling!
