@@ -2,31 +2,40 @@
 Code and model inputs to run graph-based subglacial sediment transport from SHMIP hydrology models
 
 Input Data (for examples):
+
 Input data are the matlab output files (.mat) from running SHMIP models in GlaDS
+
 Input data for series A and B models are in the directory InputData
+
 Input data for series C and D models are in the associated zenodo repository (https://doi.org/10.5281/zenodo.12570096)
 
 Model Scripts: 
 
 GraphSSeT_NetworkX.py contains the original GraphSSeT model implemented in serial using the NetworkX python module. 
+
     >>  This version is deprecated but is kept for legacy use. 
 
 GraphSSeT_NetworkX_parallel.py contains the updated GraphSSeT model implemented in parallel using ray and the NetworkX python module.
+
     >>  This version is the current working model
 
 NetworkX_funcs.py contains functions for manipulating and displaying GraphSSeT graphs.
 ReadGladsMat.py reads a GlaDS output matlab file to a NetworkX graph for either a steady state or non-steady state forcing.
 
 SHMIP_graph_ABseries.py generates a main graph and set of subgraphs for GraphSSet for a steady state model forcing. 
+
     >>  This script is suited to interactive use to generate the best realistions of your hydrology network and nice pictures etc
 
 SHMIP_SedModel_ABseries.py will run the GraphSSeT model for a set of pickle files output from SHMIP_graph_ABseries.py. 
+
     >>  This script is suited to interactive or programmatic use to generate one or multiple scenarios from one or several hydrology models. 
 
 SHMIP_graph_CDseries.py generates a main graph and (first) set of subgraphs for GraphSSet for a non-steady state model forcing. 
+
     >>  This script is suited to interactive use to generate the best realistions of your hydrology network and nice pictures etc. Data for these models are toolarge for github (get from Zenodo)
 
 SHMIP-mw_example_SedModel_Cseries.py will run the GraphSSeT model for a set of pickle files output from SHMIP_graph_CDseries.py. 
+
     >>  This script is suited to inteactive or programmatic use to generate one or multiple scenarios from one or several hydrology models.
 
 ----------------------------------------------------------------------------------------------------------------------------------
