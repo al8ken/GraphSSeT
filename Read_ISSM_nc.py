@@ -50,11 +50,12 @@ def getMeshArrays(mesh):
     return(node_array,edge_array)
 
 #This function gets the boundary conditions for the mesh edges and nodes
-def getBCs(mesh,edge_array):
+def getBCs(mesh,edge_array, hydro):
     b_mark_nodes = np.array(mesh['vertexonboundary']) #1 if on boundary, 0 otherwise
     #0 for internal nodes, 1 for boundary-contacting edges, 2 for boundary edges
     b_mark_edges = [b_mark_nodes[j[1]]+b_mark_nodes[j[2]] for i,j in enumerate(edge_array)]
-    return (b_mark_nodes,b_mark_edges)
+    o_mark_nodes = np.array(hydro['spcphi']) #0 if on outlet, NaN otherwise
+    return (b_mark_nodes,b_mark_edges, o_mark_nodes)
         
 #Access a 'constant' edge property -- one that has only one entry for the mode duration
 def getEdgeProp(data,prop):
@@ -235,9 +236,8 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
     hydro = getModelGroup(Model, 'hydrology')
     mask = getModelGroup(Model, 'mask')
     hydro = getModelGroup(Model, 'hydrology')
+    init = getModelGroup(Model, 'initialization')
     TS = getSolutionSlice(Model,'TransientSolution', step)
-    SBS = Model.groups['results']['StressbalanceSolution']
-    
     #get mesh arrays
     node_array, edge_array = getMeshArrays(mesh)
     node_ids = np.array([j[0] for i,j in enumerate(node_array)])
@@ -249,7 +249,7 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
     l = lambda x1,y1,x2,y2: np.sqrt((x2-x1)**2+(y2-y1)**2) 
     edge_l = [l(c[0][0],c[0][1],c[1][0],c[1][1]) for c in edge_coords]
     #get BCs
-    BC_nodes, BC_edges = getBCs(mesh, edge_array)
+    BC_nodes, BC_edges, BC_outlet = getBCs(mesh, edge_array, hydro)
     
     #node_mask for ice and ocean status
     ocean = getNodeProp(mask, 'ocean_levelset') # presence of ocean if < 0, coastline/grounding line if = 0, no ocean if > 0
@@ -275,6 +275,7 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
     surface_elevation = getNodeProp(geom,'surface') #surface elevation
     ice_thick = getNodeProp(geom,'thickness') #ice thickness
     bed_elevation = getNodeProp(geom,'bed') #bed elevation
+    basal_velocity_magnitude = getNodeProp(init,'vel')/365/24/3600 #basal velocity [m/s]
     try:
         bump_height = getNodeProp(hydro,'bump_height')  #bedrock bump height
     except IndexError:
@@ -289,7 +290,7 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
     node_N = getNodeProp(TS,'EffectivePressure')
     h_sheets = getNodeProp(TS,'HydrologySheetThickness')
     
-    #calculate hydraulic potential gradient for flow direction
+    #calculate hydraulic potential gradient
     edge_phis = [[node_phi[j[1]],node_phi[j[2]]] for i, j in enumerate(edge_array)]
     l = lambda a,b,c: (a-b)/c
     edge_phi_grad = np.array([l(j[0],j[1],edge_l[i]) for i, j in enumerate(edge_phis)])  
@@ -311,10 +312,10 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
     #Node Status
     #flag = -1 - 'floating' nodes where hydraulic potential is zero
     node_status = np.where(node_phi == 0.0,-1,1)   
-    #flag 0 - outlet nodes if specified in BCs
-    #node_status = np.where(BC_nodes == 2.0, 0, node_status) 
     #flag = 2 - edge nodes (may be outlets) 
     node_status = np.where(BC_nodes == 1.0, 2, node_status)
+    #flag 0 - outlet nodes if specified in BCs
+    node_status = np.where(BC_outlet == 0.0, 0, node_status) 
     #flag = 4 - moulins
     node_status = np.where(moulin_flux > 0.0, 4, node_status)
       
@@ -340,11 +341,7 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
     lasts = edge_array[:,2]
     edge_up_node = np.where(edge_flow_dir == 1, firsts,lasts)
     edge_down_node = np.where(edge_flow_dir == 1, lasts,firsts)
-    
-    #identify boundary nodes that are downstream nodes and therefore outlet nodes
-    
-    #??
-    
+        
     #now make a network X graph and add the key data
     DG = nx.DiGraph()
     #add edges one by one - perhaps adjacency matrix is faster
@@ -370,6 +367,7 @@ def ISSMtoNetworkX_one(Model, step = -1, weight_by = 'length'):
         DG.nodes[k]["BC_nodes"]=BC_nodes[j]
         DG.nodes[k]["coords"]=node_coords[j]
         DG.nodes[k]["bed_elevation"]=bed_elevation[j]
+        DG.nodes[k]["basal_velocity_magnitude"]=basal_velocity_magnitude[j]
         DG.nodes[k]["surface_elevation"]=surface_elevation[j]
         DG.nodes[k]["ice_thickness"]=ice_thick[j]
         DG.nodes[k]["hydraulic_potential"]=node_phi[j]
@@ -429,17 +427,46 @@ def ISSMtoNetworkX_multi(Model, minstep = 0, maxstep = -1, stepsize = 1, mintime
     #node_mask for ice and ocean status - for this model these do not change
     ocean = getNodeProp(mask, 'ocean_levelset') # presence of ocean if < 0, coastline/grounding line if = 0, no ocean if > 0
     ice = getNodeProp(mask, 'ice_levelset') #presence of ice if < 0, icefront position if = 0, no ice if > 0
-    #make 2D array
-    OI = np.vstack((ocean,ice)).T
-    mask = np.where(OI==[-1,1],0,99) # open ocean, 99 for unclassified
-    mask = np.where(OI==[-1,0],4,mask) # ice shelf front
-    mask = np.where(OI==[-1,-1],1,mask) # ice shelf
-    mask = np.where(OI==[0,1],5,mask) # ice free coast
-    mask = np.where(OI==[0,0],6,mask) # icefront at coast (no shelf)
-    mask = np.where(OI==[0,-1],7,mask) # grounding line
-    mask = np.where(OI==[1,1],2,mask) # land
-    mask = np.where(OI==[1,0],8,mask) # grounded ice front
-    mask = np.where(OI==[1,-1],3,mask) # grounded ice
+    if np.nanmin(ocean) > 0:
+        print('no ocean mask applied (all grounded), just ice mask')
+        mask = np.ones_like(ice)*99 # 99 for unclassified
+        m = np.where(ice < 0 )[0] # grounded ice
+        mask[m] = 3
+        m = np.where(ice == 0 )[0] # glacial terminus
+        mask[m] = 8
+        m = np.where(ice > 0 )[0] # exposed land
+        mask[m] = 9
+    elif np.nanmin(ice) > 0:
+        #NB this should not happen but included for completeness
+        print('no ice mask applied (no ice present), just ocean mask - this perhaps is an error?')
+        mask = np.ones_like(ocean)*99 # 99 for unclassified
+        m = np.where(ocean < 0 )[0] # open ocean
+        mask[m] = 0
+        m = np.where(ocean == 0 )[0] # coastline
+        mask[m] = 4
+        m = np.where(ocean > 0 )[0] # exposed land
+        mask[m] = 9
+    else:
+        print('both ocean and ice masks applied')
+        #fix this later it does not apply to Finland
+        # mask = np.ones_like(ocean)*99 # 99 for unclassified
+        # m = np.where(OI==[-1,1])[0] # 0 open ocean
+        # mask[m] = 0                
+        # m = np.where(OI==[-1,0])[0] # ice shelf front
+        # mask[m] = 4
+        # m = np.where(OI==[-1,-1])[0]
+        # mask[m] = 1 # ice shelf
+        # m = np.where(OI==[0,1])[0]
+        # mask[m] = 5 # ice free coast
+        # m = np.where(OI==[0,0])[0]
+        # mask[m] = 6 # icefront at coast (no shelf)
+        # m = np.where(OI==[0,-1])[0]
+        # mask[m] = 7 # grounding line
+        # m = np.where(OI==[1,1])[0]
+        # mask[m] = 2 # land
+        # m = np.where(OI==[1,0])[0]
+        # mask[m] = 8# grounded ice front
+        # m = np.where(OI==[1,-1])[0]
     
     #get stable node properties
     try:
@@ -478,13 +505,13 @@ def ISSMtoNetworkX_multi(Model, minstep = 0, maxstep = -1, stepsize = 1, mintime
         data = TS[key]
         #edge channel area and discharge array
         edge_S[i] = getEdgeProp(data,'ChannelArea')
-        edge_Q[i] = np.abs(getEdgeProp(data,'ChannelDischarge'))
+        edge_Q[i] = np.abs(getEdgeProp(data,'ChannelDischarge')) #negative values are eliminated
         #node effective pressure, sheet thickness and basal velocity
         node_phi[i] = getNodeProp(data,'HydraulicPotential') #hydraulic potential
         node_N[i] = getNodeProp(data,'EffectivePressure')
         h_sheets[i] = getNodeProp(data,'HydrologySheetThickness')
     
-        #calculate hydraulic potential gradient for flow direction
+        #calculate hydraulic potential gradient
         edge_phis = [[node_phi[i][n[1]],node_phi[i][n[2]]] for m, n in enumerate(edge_array)]
         l = lambda a,b,c: (a-b)/c
         edge_phi_grad[i] = np.array([l(n[0],n[1],edge_l[m]) for m,n in enumerate(edge_phis)])  
@@ -526,11 +553,14 @@ def ISSMtoNetworkX_multi(Model, minstep = 0, maxstep = -1, stepsize = 1, mintime
             print( 'weight_by choice not supported, using length')
             edge_weights[i] = edge_l/np.nanmax(edge_l)
             
-        #assign maximum weight to bo[undary edges
+        #assign maximum weight to boundary edges
         edge_weights[i] = np.where(BC_edges==2,1,edge_weights[i])
         
         #flow direction may be either way
         edge_flow_dir[i] = np.where(edge_phi_grad[i]>0,1,0)
+        
+        #swap the sign for hpg where flow direction is reversed 
+        edge_phi_grad[i] = np.where(edge_flow_dir[i]==0,edge_phi_grad[i]*-1,edge_phi_grad[i])
     
     firsts = edge_array[:,1]
     lasts = edge_array[:,2]
@@ -566,29 +596,35 @@ def ISSMtoNetworkX_multi(Model, minstep = 0, maxstep = -1, stepsize = 1, mintime
         s = es[m]
         ca = cas[m]
         cf = cfs[m]
-        hpg = np.abs(epg[m])
+        #hpg = np.abs(epg[m])# here we do not allow negatives - all rests on flow dir
+        hpg = epg[m] # here we allow negative hpg to indicate changes in edge direction (should match changes in flow dir)
         #we add from up to down, giving direction
         DG.add_edge(edge_up_node[m],
                     edge_down_node[m], 
                     coords = c, 
                     length = l,
                     status = s[0],
-                    statuses = s,
+                    status_arr = s,
                     weight = w[0],
-                    weights = w,
+                    weight_arr = w,
                     direction = d[0],
-                    directions = d, 
-                    hyd_pot_grad = hpg, 
-                    channel_area = ca, 
-                    channel_flux  = cf,
+                    direction_arr = d, 
+                    hyd_pot_grad = hpg[0], 
+                    hyd_pot_grad_arr = hpg, 
+                    channel_area = ca[0], 
+                    channel_area_arr = ca, 
+                    channel_flux  = cf[0],
+                    channel_flux_arr = cf,
                     edge_bc = bc, 
                     time = t,
-                    last_time = t[0])              
+                    last_time = t[0],
+                    )              
  
     #add node attributes - not all are essential
     for j,k in enumerate(node_ids):
         if k in DG.nodes():
             #static props
+            DG.nodes[k]["mask"]=mask[j]
             DG.nodes[k]["coords"]=node_coords[j]
             DG.nodes[k]["bed_elevation"]=bed_elevation[j]
             DG.nodes[k]["surface_elevation"]=surface_elevation[j]
@@ -597,8 +633,12 @@ def ISSMtoNetworkX_multi(Model, minstep = 0, maxstep = -1, stepsize = 1, mintime
             DG.nodes[k]["moulin_flux"]=moulin_flux[j]
             DG.nodes[k]["bump_height"]=bump_height[j]
             #changing props
-            DG.nodes[k]["node_status"]=ns[j]
-            DG.nodes[k]["hydraulic_potential"]=nphi[j]
-            DG.nodes[k]["effective_pressure"]=nN[j]
-            DG.nodes[k]["h_sheet"]=nh[j]
+            DG.nodes[k]["node_status"]=ns[j][0]
+            DG.nodes[k]["node_status_arr"]=ns[j]
+            DG.nodes[k]["hydraulic_potential"]=nphi[j][0]
+            DG.nodes[k]["hydraulic_potential_arr"]=nphi[j]
+            DG.nodes[k]["effective_pressure"]=nN[j][0]
+            DG.nodes[k]["effective_pressure_arr"]=nN[j]
+            DG.nodes[k]["h_sheet"]=nh[j][0]
+            DG.nodes[k]["h_sheet_arr"]=nh[j]
     return DG

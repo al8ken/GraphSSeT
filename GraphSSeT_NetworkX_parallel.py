@@ -29,9 +29,10 @@ import itertools
 import random
 import ray
 from NetworkX_funcs import AsynFluid
-from scipy.stats import norm
+import scipy.stats as stats
+import scipy.optimize as opt
+import scipy.sparse as sp
 import sys
-
 if not sys.warnoptions:
     import warnings
     warnings.simplefilter("ignore")
@@ -42,12 +43,14 @@ if not sys.warnoptions:
 _SUPPORTED_POTGRAD_METHODS = ["Direct", "Potential","IceThickness","SurfaceElevation"]
 #channel flux calculation method"
 _SUPPORTED_CFLUX_METHODS = ["FluxArea","Flux","InputEdge", "InputNode", "InputBoth"]
-#sediment transport capacity formulation - only EngelundHansen for now
+#sediment transport capacity formulation - only EngelundHansen works for now
 _SUPPORTED_TRANSPORT_METHODS = ["EngelundHansen","MeyerParkerMuller"]
 #Erosion law formulation
 _SUPPORTED_EROSION_METHODS = ["Direct","Vel", "VelTau","MixedBed","InfiniteTill"]
 #detritus tracking methods
 _SUPPORTED_DETRITUS_METHODS = ["SedErod","NodeProp","None"]
+#advection methods
+_SUPPORTED_ADVECTION_METHODS = ["Schlegel","VelThick","None"]
 
 @ray.remote(max_restarts = 0)
 class SubglacialErosionandSedimentFlux():
@@ -58,31 +61,46 @@ class SubglacialErosionandSedimentFlux():
     def __init__(
         self,
         graph,
+        #methods
         potgrad_method = "Direct",
         cflux_method = "Flux",
         erosion_method = "Direct",
         transport_method="EngelundHansen",
         detritus_method="SedErod",
-        bed_porosity=0.3,
+        advection_method="None",
+        #basic physics
         g=9.81, #m/s^2
         fluid_density=1000.0, #kg/m^3
         ice_density = 910.0, #kg/m^3
-        HookeAngle=180, #degrees -- 'pi' is a semi-circle appropriate for GlaDS
-        DarchWeisbachFrictionFactor=0.15,
-        Herodelim = 0.75, #m
+        #thickness parameters
         MaxTillH=1.0, #m
         InitTillH = 0.00, #m
+        bed_porosity=0.3,
+        #channelised flow properties
+        HookeAngle=180, #degrees -- 'pi' is a semi-circle appropriate for GlaDS
+        DarchWeisbachFrictionFactor=0.15,
+        Dhmin = 0.21, #m
+        # fluvial sed transport
         SedimentUptakeLengthFactor = 1., #m default is to use edge length, values > 1 will damp the and make the models less sensitive; values < 1 are not permitted
         Dsig = 1e-3, #m
-        Dhmin = 0.21, #m
+        #grain size and grain density
         meanD = 2.2, # as Phi
         stdD = 1.5, # as Phi
         rhog = 2650.0, #kg m-3
-        K = 1e-4,
+        #erosion parameters
+        Herodelim = 0.75, #m
+        K = 1e-4, #parameters from Herman et al 20xx
         L = 1,
-        W = 2e-10,
+        W = 2e-10,#parameters from Pollard Deconto et al 20xx
+        #advection parameters        
+        Ct=3e-11, #parameters from Schlegel et al 2025
+        C1=1.5e3, 
+        C2=2e9,
+        AdvT = 0.01, #m
+        #sampling paramaters
         samp_n = 100,
         RNarray = None
+        
     ):
         if not isinstance(graph,nx.classes.digraph.DiGraph):
             msg = "SubglacialErosionandSedimentTransporter: graph must be a networkx directed graph but is {}".format(type(graph))
@@ -121,6 +139,10 @@ class SubglacialErosionandSedimentFlux():
         self._k = K
         self._l = L
         self._w = W
+        self._adv_Ct = Ct
+        self._adv_C1 = C1
+        self._adv_C2 = C2
+        self._adv_T = AdvT
         self._samp_n = samp_n
         if RNarray is not None:
             self._RNarray_len = len(RNarray)
@@ -149,7 +171,14 @@ class SubglacialErosionandSedimentFlux():
             msg = "SubglacialErosionandSedimentFlux: invalid erosion method not supported."
             raise ValueError(msg)
 
-        # check the transport method is valid.
+        #check the advection method is valid
+        if advection_method in _SUPPORTED_ADVECTION_METHODS:
+            self._advection_method = advection_method
+        else:
+            msg = "SubglacialErosionandSedimentFlux: invalid advection method not supported."
+            raise ValueError(msg)
+
+        # check the fluvial transport method is valid.
         if transport_method in _SUPPORTED_TRANSPORT_METHODS:
             self._transport_method = transport_method
         else:
@@ -297,9 +326,65 @@ class SubglacialErosionandSedimentFlux():
         SetGraphAttributeFromArray(Graph, self._DPhi, self._edge_keys, 'DPhi')
         return Graph
     
+    def _calc_advection_rate(self, Graph = None):
+        '''this function calculates for an edge the till advection rate using equations 1, 2 and 3 from Schlegel et al., 2025
+        https://doi.org/10.1111/bor.70002
+        N (Pa) and ub (m/s) are edge arrays for effective pressure and velocity magnitude
+        Ct is a edge array or scalar
+        C1 and C2 are scalars
+        outputs:
+        ut (m/s) is an edge array of the critical velocity
+        Q (m^2/s) is an edge array of the 1D flow rate
+        '''
+        if Graph == None:
+            print('No graph provided, getting the base graph', flush = True)
+            Graph = ray.get(self._graph)
+        msg = "SubglacialErosionandSedimentFlux: Data attributes needed for advection method not found."
+        if self._advection_method == "Schlegel":
+            if "effective_pressure" in self._edge_attributes:
+                N_edges = nx.get_edge_attributes(Graph,'effective_pressure')
+            elif "effective_pressure" in self._node_attributes:
+                Nnode = Graph.nodes(data = 'effective_pressure')
+                Nedge = np.array([(Nnode[key[0]] + Nnode[key[1]])/2 for key in self._edge_keys])
+                N_edges = {j: Nedge[i] for i,j in enumerate(self._edge_keys)}
+            else:
+                raise ValueError(msg)
+            N = np.array([val if val >0 else 0 for key,val in N_edges.items()])
+            if 'basal_velocity_magnitude' in self._edge_attributes:
+                V_edges = nx.get_edge_attributes(Graph,'basal_velocity_magnitude')
+            elif 'basal_velocity_magnitude' in self._node_attributes:
+                Vnode = Graph.nodes(data = 'basal_velocity_magnitude')
+                Vedge = np.array([(Vnode[key[0]] + Vnode[key[1]])/2 for key in self._edge_keys])
+                V_edges = {j: Vedge[i] for i,j in enumerate(self._edge_keys)}
+            else:
+                raise ValueError(msg)
+            ub = np.array([val if val >0 else 0 for key,val in V_edges.items()])
+            ut = N*self._adv_Ct
+            delta_u = ub-ut
+            con = np.where(delta_u < 0, 0, delta_u)
+            self._advection_T = self._adv_C1*N/(self._adv_C2+N**2)
+            self._advection_Q = self._advection_T*con
+            SetGraphAttributeFromArray(Graph, self._advection_T, self._edge_keys, 'advection_thickness')
+            SetGraphAttributeFromArray(Graph, self._advection_Q, self._edge_keys, 'advection_rate')
+        elif self._advection_method == "VelThick": #in this case we dont depend on N
+            if 'basal_velocity_magnitude' in self._edge_attributes:
+                V_edges = nx.get_edge_attributes(Graph,'basal_velocity_magnitude')
+            elif 'basal_velocity_magnitude' in self._node_attributes:
+                Vnode = Graph.nodes(data = 'basal_velocity_magnitude')
+                Vedge = np.array([(Vnode[key[0]] + Vnode[key[1]])/2 for key in self._edge_keys])
+                V_edges = {j: Vedge[i] for i,j in enumerate(self._edge_keys)}
+            else:
+                raise ValueError(msg)
+            ub = np.array([val for key,val in V_edges.items()])
+            self._advection_T = self._adv_T
+            self._advection_Q = self._adv_T*ub
+            SetGraphAttributeFromArray(Graph, self._advection_T, self._edge_keys, 'advection_thickness')
+            SetGraphAttributeFromArray(Graph, self._advection_Q, self._edge_keys, 'advection_rate')
+        return Graph
+    
     def _calc_erosion_rate(self, Graph = None):
         if Graph == None:
-            print('No graph provided, getting the base graph')
+            print('No graph provided, getting the base graph', flush = True)
             Graph = ray.get(self._graph)
         """methods to calculate the erosion potential using one of the permitted methods in functions VelScaled or VelTauScaled"""
         msg = "SubglacialErosionandSedimentFlux: Data attributes needed for erosion method not found."
@@ -341,7 +426,7 @@ class SubglacialErosionandSedimentFlux():
     
     def _calc_channel_flux_on_edge(self, Graph = None):
         if Graph == None:
-            print('No graph provided, getting the base graph')
+            print('No graph provided, getting the base graph', flush = True)
             Graph = ray.get(self._graph)
         """methods to calculate channelised flux on edges and output to downstream node"""
         msg = "SubglacialErosionandSedimentFlux: Data attributes needed for selected flux method not found."
@@ -403,6 +488,465 @@ class SubglacialErosionandSedimentFlux():
         SetGraphAttributeFromArray(Graph, self._cflux, self._edge_keys, 'channel_flux')
         # flux leaving the edge as QWout (an edge property)
         SetGraphAttributeFromArray(Graph, outflux, self._edge_keys, 'QWout')
+        return Graph
+    
+    def _calc_advection_geometry_sp(self, Graph = None, mesh = 'triangular'):
+        '''this function defines the geometry for till advection over the graph. 
+           For triangular meshes, returns an n+1 by m matrix where n is # triangles and m is # edges.
+           The last row is all singleton edges that don't belong to any triangle
+           This function needs to be run only once for each mesh geometry'''
+        if Graph == None:
+            print('No graph provided, getting the base graph', flush = True)
+            Graph = ray.get(self._graph)     
+        GUD = Graph.to_undirected(as_view=True) #an undirected version as a view
+        #set up the geometry
+        if mesh == 'triangular':
+            #Tracking assuming a triangular mesh. Edges that do not form triangle edges may not be correctly modelled
+            #in GraphSSeT each edge happens only once, so we can sort for consistency with undirected graph
+            edge_index = {tuple(sorted(e)): i for i, e in enumerate(self._edge_keys)}
+            G_triangles = {frozenset(t) for t in nx.enumerate_all_cliques(GUD) if len(t) == 3}
+            triangles = list(G_triangles)
+            nT = len(triangles)
+            nE = len(self._edge_keys)
+            rows = []
+            cols = []
+    
+            for t_id, tri in enumerate(triangles):
+                u, v, w = sorted(tri)
+                tri_edges = [(u,v), (u,w), (v,w)]
+            
+                for (u,v) in tri_edges:
+                    rows.append(t_id)
+                    cols.append(edge_index[(u,v)]) 
+    
+            data = np.ones(len(rows), dtype=np.int8)
+            T2E = sp.coo_matrix((data, (rows, cols)), shape=(nT, nE)).tocsr()
+            
+            #get number of triangles for boundary condition. Should normally be 2 (2 closed triangles), 1 at the boundary (1 closed triangle) or 0 (no closed triangles))
+            Edge_Tris = np.sum(T2E, axis = 0).A1
+            self._EB_Dict = {}
+            for i,j in enumerate(Edge_Tris):
+                if j == 2:
+                    self._EB_Dict[self._edge_keys[i]] = 'normal'
+                elif j == 1:
+                    self._EB_Dict[self._edge_keys[i]] = 'boundary'
+                elif j == 0:
+                    self._EB_Dict[self._edge_keys[i]] = 'linear'
+                else:
+                    print(F'inconsistent geometry detected for edge {self._edge_keys[i]}', flush = True)
+            
+            #Get the node coords
+            if "coords" in self._node_attributes:
+                n_coords =  nx.get_node_attributes(Graph,'coords')
+            elif "coords" in self._edge_attributes:
+                e_coords =  nx.get_node_attributes(Graph,'coords')
+                #this can be broken back down to node coords, we take the first only
+                n_coords1 = {key[0]: val[0] for key,val in e_coords.items()}
+                n_coords2 = {key[1]: val[1] for key,val in e_coords.items()}
+                n_coords = n_coords1|n_coords2
+            else:
+                raise AttributeError('No way to determine coordinates')
+            
+            # Triangle normals to be stored as two sparse matrices: TNN_x and TNN_y
+            # This avoids a dense 3D array
+            
+            tnn_rows = []
+            tnn_cols = []
+            tnn_x_data = []
+            tnn_y_data = []
+    
+            for t_id, t in enumerate(triangles):
+                t_nodes = list(t)
+                # define as a closed loop, we guess at the edge direction
+                t_edges = [(t_nodes[0],t_nodes[1]),(t_nodes[1],t_nodes[2]),(t_nodes[2],t_nodes[0])]
+                #reverse edges that are not found in edge list
+                t_edges = [(u,v) if (u,v) in self._edge_keys else (v,u) for (u,v) in t_edges]
+                # get the columns for each edge
+                edge_cols = [edge_index[tuple(sorted(e))] for e in t_edges]
+                
+                #get coordinates for the edges in order making a loop
+                t_coords =  [(n_coords[t_nodes[0]],n_coords[t_nodes[1]]),
+                             (n_coords[t_nodes[1]],n_coords[t_nodes[2]]),
+                             (n_coords[t_nodes[2]],n_coords[t_nodes[0]])]
+                #midpoints
+                get_mid = lambda e: ((e[0][0]+e[1][0])/2,(e[0][1]+e[1][1])/2)
+                t_midpoints = [get_mid(coords) for coords in t_coords]
+                # the edge normal is the 'left' normal relative to graph edge direction.
+                get_norm = lambda e: (-(e[1][1]-e[0][1]),e[1][0]-e[0][0])
+                t_normals = [get_norm(coords)/np.linalg.norm(get_norm(coords)) for coords in t_coords]
+                # get the centroid    
+                t_centroid = np.mean(t_midpoints,axis = 0)
+                for i,normal in enumerate(t_normals):
+                    if np.dot(t_midpoints[i] - t_centroid, normal) < 0:
+                        t_normals[i] = -np.array(normal)
+                    else:
+                        t_normals[i] = np.array(normal)
+                
+                for n, col in enumerate(edge_cols):
+                    tnn_rows.append(t_id)
+                    tnn_cols.append(col)
+                    tnn_x_data.append(t_normals[n][0])
+                    tnn_y_data.append(t_normals[n][1])
+            
+            # for non-triangle edges we define their normals in an extra row
+            Singletons = np.where(Edge_Tris == 0)[0]
+            singleton_row_idx = nT
+            for col in Singletons:
+                edge = self._edge_keys[col]
+                e_coords = (n_coords[edge[0]], n_coords[edge[1]])
+                get_norm = lambda e: (-(e[1][1]-e[0][1]),e[1][0]-e[0][0])
+                normal = get_norm(e_coords)/np.linalg.norm(get_norm(e_coords))
+               
+                tnn_rows.append(singleton_row_idx)
+                tnn_cols.append(col)
+                tnn_x_data.append(normal[0])
+                tnn_y_data.append(normal[1])
+                
+            # Create sparse matrices for TNN components
+            shape = (nT + 1, nE)
+            self._TNN_x = sp.csr_matrix((tnn_x_data, (tnn_rows, tnn_cols)), shape=shape)
+            self._TNN_y = sp.csr_matrix((tnn_y_data, (tnn_rows, tnn_cols)), shape=shape)
+            
+        elif mesh == 'quadrilateral':
+            raise ValueError(' quadrilatral meshes not implemented yet')
+        else:
+            raise ValueError('recgonised mesh geometries are "triangular" and "quadrilateral"')
+        return Graph
+    
+    def _calc_advection_geometry(self, Graph = None, mesh = 'triangular'):
+        '''this function defines the geometry for till advection over the graph. 
+           For triangular meshes, returns an n+1 by m matrix where n is # triangles and m is # edges.
+           The last row is all singleton edges that don't belong to any triangle
+           This function needs to be run only once for each mesh geometry'''
+        if Graph == None:
+            print('No graph provided, getting the base graph', flush = True)
+            Graph = ray.get(self._graph)     
+        GUD = Graph.to_undirected(as_view=True) #an undirected version as a view
+        #set up the geometry
+        if mesh == 'triangular':
+            #Tracking assuming a triangular mesh. Edges that do not form triangle edges may not be correctly modelled
+            #in GraphSSeT each edge happens only once, so we can sort for consistency with undirected graph
+            edge_index = {tuple(sorted(e)): i for i, e in enumerate(self._edge_keys)}
+            G_triangles = {frozenset(t) for t in nx.enumerate_all_cliques(GUD) if len(t) == 3}
+            triangles = list(G_triangles)
+            nT = len(triangles)
+            nE = len(self._edge_keys)
+            rows = []
+            cols = []
+
+            for t_id, tri in enumerate(triangles):
+                u, v, w = sorted(tri)
+                tri_edges = [(u,v), (u,w), (v,w)]
+            
+                for (u,v) in tri_edges:
+                    rows.append(t_id)
+                    try:
+                        cols.append(edge_index[(u,v)]) 
+                    except IndexError:
+                        #this should not be needed
+                        print(f'reversing edge {(u,v)}')
+                        cols.append(edge_index[(v,u)])
+            
+            data = np.ones(len(rows), dtype=np.int8)
+            T2E = sp.coo_matrix((data, (rows, cols)), shape=(nT, nE)).tocsr()
+            
+            #get number of triangles for boundary condition. Should normally be 2 (2 closed triangles), 1 at the boundary (1 closed triangle) or 0 (no closed triangles))
+            Edge_Tris = np.sum(T2E, axis = 0).A1
+            self._EB_Dict = {}
+            for i,j in enumerate(Edge_Tris):
+                if j == 2:
+                    self._EB_Dict[self._edge_keys[i]] = 'normal'
+                elif j == 1:
+                    self._EB_Dict[self._edge_keys[i]] = 'boundary'
+                elif j == 0:
+                    self._EB_Dict[self._edge_keys[i]] = 'linear'
+                else:
+                    print(F'inconsistent geometry detected for edge {self._edge_keys[i]}', flush = True)
+            
+            #Get the node coords
+            if "coords" in self._node_attributes:
+                n_coords =  nx.get_node_attributes(Graph,'coords')
+            elif "coords" in self._edge_attributes:
+                e_coords =  nx.get_node_attributes(Graph,'coords')
+                #we wont bother now but this can be broken back down to node coords
+            
+            #now for each triangle we need to define normals and align them to point outwards, 
+            #we store these in a copy of the T2E (as 3D array) that allows to store tuples
+            
+            TN = T2E.copy().toarray()
+            TNN = np.stack((TN, TN), axis=2, dtype = np.float64)
+            for t_id, t in enumerate(triangles):
+                t_nodes = list(t)
+                # define as a closed loop, we guess at the edge direction
+                t_edges = [(t_nodes[0],t_nodes[1]),(t_nodes[1],t_nodes[2]),(t_nodes[2],t_nodes[0])]
+                #reverse edges that are not found in edge list
+                t_edges = [(u,v) if (u,v) in self._edge_keys else (v,u) for (u,v) in t_edges]
+                # get the columns for each edge
+                edge_cols = [self._edge_keys.index(e) for e in t_edges]
+                #get coordinates for the edges in order making a loop
+                t_coords =  [(n_coords[t_nodes[0]],n_coords[t_nodes[1]]),
+                             (n_coords[t_nodes[1]],n_coords[t_nodes[2]]),
+                             (n_coords[t_nodes[2]],n_coords[t_nodes[0]])]
+                #midpoints
+                l = lambda e: ((e[0][0]+e[1][0])/2,(e[0][1]+e[1][1])/2)
+                t_midpoints = [l(coords) for coords in t_coords]
+                # the edge normal is the 'left' normal relative to graph edge direction.
+                l = lambda e: (-(e[1][1]-e[0][1]),e[1][0]-e[0][0])
+                t_normals = [l(coords)/np.linalg.norm(l(coords)) for coords in t_coords]
+                # get the centroid    
+                t_centroid = np.mean(t_midpoints,axis = 0)
+                for i,normal in enumerate(t_normals): #T1
+                    if np.dot(t_midpoints[i] - t_centroid, normal) < 0:
+                        t_normals[i] = -normal
+                for n,col in enumerate(edge_cols):
+                    TNN[t_id][col] = t_normals[n]
+            
+            # for non-triangle edges we define their normals in an extra row
+            Singletons = np.where(Edge_Tris == 0)[0]
+            #print(f'Number of singleton edges {len(Singletons)}')
+            TN_singles = [np.zeros_like((TNN[0]))]    
+            for col in Singletons:
+                edge = self._edge_keys[col]
+                #get coordinates for each node
+                e_coords =  (n_coords[edge[0]],n_coords[edge[1]])
+                # the edge normal is the 'left' normal relative to graph edge direction.
+                l = lambda e: (-(e[1][1]-e[0][1]),e[1][0]-e[0][0])
+                TN_singles[0][col] = l(e_coords)/np.linalg.norm(l(e_coords))
+            self._TNN = np.concatenate([TNN, TN_singles],axis = 0)    
+        elif mesh == 'quadrilateral':
+            #Tracking assuming a quadrilateral mesh. Edges that do not form quadrilateral edges may not be correctly modelled
+            raise ValueError(' quadrilatral meshes not implemented yet')
+        else:
+            raise ValueError('recgonised mesh geometries are "triangular" and "quadrilateral"')
+        return Graph
+    
+    def _calc_advection_flux_sp(self, Graph = None, mesh = 'triangular'):
+        '''this function maps till advection across edges using an input-output method 
+           some rules:
+              each edge is mapped individually
+                  Qres = inflow from upstream triangle - outflow to downstream triangle
+              flow conserves mass at local scale (no storage in triangles) 
+              boundary conditions: 
+                  domain boundary edges conserve mass (Qin = Qout on domain boundary edges)
+                  downstream boundary edges (outlets) do not conserve mass
+                  isolated edges conserve mass except where outlet edges
+         this function needs to be run after 
+         'calc_advection rate' and rerun anytime those parameters change
+         for example changing velocity or effective pressure
+        '''
+        if Graph == None:
+            print('No graph provided, getting the base graph', flush = True)
+            Graph = ray.get(self._graph) 
+        if mesh == 'triangular':
+            #Calculating flux assuming a triangular mesh. Edges that do not form triangle edges may not be correctly modelled
+            if 'basal_velocity_vector' in self._edge_attributes:
+                VV_edges = nx.get_edge_attributes(Graph,'basal_velocity_vector')
+            elif 'basal_velocity_vector' in self._node_attributes:    
+                VVnode = nx.get_node_attributes(Graph,'basal_velocity_vector')
+                VVedge = np.array([((VVnode[key[0]][0] + VVnode[key[1]][0])/2,(VVnode[key[0]][1] + VVnode[key[1]][1])/2) for key in self._edge_keys])
+                VV_edges = {j: VVedge[i] for i,j in enumerate(self._edge_keys)}
+                nx.set_edge_attributes(Graph,VV_edges,'basal_velocity_vector')
+    
+            #get status from graph
+            status = nx.get_edge_attributes(Graph,'status')
+    
+            #convert ub_vec into unit vector and magnitude
+            ub_mags = np.array([np.linalg.norm(VV_edges[edge]) for edge in self._edge_keys])
+            ub_vs = np.array([(VV_edges[edge][0],VV_edges[edge][1]) for edge in self._edge_keys])
+            
+            # Handle zero magnitude to avoid division by zero
+            ub_uvs = np.zeros_like(ub_vs)
+            mask = ub_mags > 0
+            ub_uvs[mask] = ub_vs[mask] / ub_mags[mask][:, None]
+            
+            # TN is the indicator of non-zero entries in TNN
+            # Since TNN_x and TNN_y share the same sparsity pattern (3 edges per triangle)
+            # We can get TN as a sparse matrix directly
+            TN = (self._TNN_x != 0).astype(np.float64).tocsr()
+            self._TN = TN # Keep for consistency with other methods
+    
+            # Scalar multipliers for the sparse matrix
+            # TN * self._length where self._length is a vector of length nE
+            # This is equivalent to multiplying each column of TN by the corresponding length
+            T_length = TN.multiply(self._length).tocsr() 
+            T_Q_mag = TN.multiply(self._advection_Q).tocsr()
+            
+            # Vector quantity T_uvs is [nE, 2]. 
+            # TQs = sum over o (TNN_mno * T_uvs_no) * T_length * T_Q_mag
+            # TQs_mn = (TNN_x_mn * ub_uvs_x_n + TNN_y_mn * ub_uvs_y_n) * T_length_mn * T_Q_mag_mn
+            
+            TNN_x_dot_U = self._TNN_x.multiply(ub_uvs[:, 0])
+            TNN_y_dot_U = self._TNN_y.multiply(ub_uvs[:, 1])
+            T_dot = (TNN_x_dot_U + TNN_y_dot_U).tocsr()
+            
+            # Final TQs calculation (element-wise multiplication of sparse matrices)
+            # T_length and T_Q_mag already have the sparsity pattern of TN
+            self._TQs = T_dot.multiply(T_length).multiply(T_Q_mag).tocsr()
+    
+            # solve the flow so as to conserve mass for each triangle 
+            # We pass the sparse components to the refactored solver
+            Sol, PredQs = unconstrained_least_squares_sparse(self._TNN_x, self._TNN_y, T_length, ub_uvs, self._TQs)
+            
+            # for singleton edges we just keep T_Qs, but need to add back to the PredQs
+            # PredQs is returned as a sparse matrix for all but the last row
+            singleton_row = self._TQs[-1, :]
+            PredQs = sp.vstack([PredQs, singleton_row]).tocsr()
+            
+            #flux from the triangle into the edge is positive sign
+            Qin_data = np.maximum(PredQs.data, 0)
+            Qin = sp.csr_matrix((Qin_data, PredQs.indices, PredQs.indptr), shape=PredQs.shape)
+            
+            #flux from the edge out to the triangle is negative
+            Qout_data = np.minimum(PredQs.data, 0)
+            Qout = sp.csr_matrix((Qout_data, PredQs.indices, PredQs.indptr), shape=PredQs.shape)
+            
+            #We need the max/min across triangles for each edge (column-wise)
+            Qin_edges = np.array(Qin.tocsc().max(axis=0).toarray()).flatten()
+            Qout_edges = np.array(Qout.tocsc().min(axis=0).toarray()).flatten()
+            #Qin_edges = np.array(Qin.max(axis=0).toarray()).flatten()
+            #Qout_edges = np.array(Qout.min(axis=0).toarray()).flatten()
+             
+            #We filter Qin,Qout,Qres depending on Boundary Condition
+            isPartBoundary = np.array([True if BC=='boundary' else False for edge,BC in self._EB_Dict.items()])
+            isLinear = np.array([True if BC=='linear' else False for edge,BC in self._EB_Dict.items()])
+            isOutlet = np.array([True if status.get(edge)==0 else False for edge in self._edge_keys])
+            isBoundary = np.array([True if status.get(edge)==3 else False for edge in self._edge_keys])
+            
+            #for normal edges - we do nothing    
+            Qin_final = Qin_edges.copy()
+            Qout_final = Qout_edges.copy()
+            
+            #for partition boundary edges when harmonising we select the upstream edge so we would get (generally) accumulation if left free
+            #here we enforce a Qin=Qout boundary condition on them, so H does not change, comment these next lines out for a free boundary condition
+            mask_pb = isPartBoundary & ~isOutlet
+            Qin_final[mask_pb & (Qin_final == 0)] = -Qout_final[mask_pb & (Qin_final == 0)]
+            Qout_final[mask_pb & (Qout_final == 0)] = -Qin_final[mask_pb & (Qout_final == 0)]
+          
+            #for true boundary edges we match input and output, so Qres is 0
+            mask_b = isBoundary & ~isOutlet
+            Qin_final[mask_b & (Qin_final == 0)] = -Qout_final[mask_b & (Qin_final == 0)]
+            Qout_final[mask_b & (Qout_final == 0)] = -Qin_final[mask_b & (Qout_final == 0)]
+            
+            #for outlet boundary edges we adjust the Qout to not constrain H if flow from the triangle is not the same as the local Qs
+            #this MIGHT be either an inlet or outlet to the partition  - the point is the free boundary condition
+            # we get the average of the edge across all triangles, although boundary edges have just one triangle so there should be exactly one entry
+            TQs_csc = self._TQs.tocsc()
+            TQs_sum = np.array(TQs_csc.sum(axis=0)).flatten()
+            TQs_count = np.diff(TQs_csc.indptr)
+            #TQs_sum = np.array(self._TQs.sum(axis=0)).flatten()
+            # Count non-zero entries per column using CSC format
+            #TQs_count = np.diff(self._TQs.tocsc().indptr)
+            Qs_loc = np.zeros_like(TQs_sum)
+            mask_count = TQs_count != 0
+            Qs_loc[mask_count] = TQs_sum[mask_count] / TQs_count[mask_count]
+            
+            Qout_final[isOutlet & isPartBoundary] = -Qs_loc[isOutlet & isPartBoundary]
+            
+            #for linear edges we just enforce the sign convention for local Qs
+            Qin_lin = np.abs(Qs_loc)
+            self._advection_Qin = np.where(isLinear,Qin_lin,Qin_final)
+            SetGraphAttributeFromArray(Graph, self._advection_Qin, self._edge_keys, 'advection_Qin')
+            self._advection_Qout = np.where(isLinear,-Qin_lin,Qout_final)
+            SetGraphAttributeFromArray(Graph, self._advection_Qout, self._edge_keys, 'advection_Qout')
+        elif mesh == 'quadrilateral':
+            raise ValueError(' quadrilatral meshes not implemented yet')
+        else:
+            raise ValueError('recgonised mesh geometries are "triangular" and "quadrilateral"')
+        return Graph
+    
+    def _calc_advection_flux(self, Graph = None, mesh = 'triangular'):
+        '''this function maps till advection across edges using an input-output method 
+           some rules:
+              each edge is mapped individually
+                  Qres = inflow from upstream triangle - outflow to downstream triangle
+              flow conserves mass at local scale (no storage in triangles) 
+              boundary conditions: 
+                  domain boundary edges conserve mass (Qin = Qout on domain boundary edges)
+                  downstream boundary edges (outlets) do not conserve mass
+                  isolated edges conserve mass except where outlet edges
+         this function needs to be run after 
+         'calc_advection rate' and rerun anytime those parameters change
+         for example changing velocity or effective pressure
+        '''
+        if Graph == None:
+            print('No graph provided, getting the base graph', flush = True)
+            Graph = ray.get(self._graph) 
+        if mesh == 'triangular':
+            #Calculating flux assuming a triangular mesh. Edges that do not form triangle edges may not be correctly modelled
+            if 'basal_velocity_vector' in self._edge_attributes:
+                VV_edges = nx.get_edge_attributes(Graph,'basal_velocity_vector')
+            elif 'basal_velocity_vector' in self._node_attributes:    
+                VVnode = nx.get_node_attributes(Graph,'basal_velocity_vector')
+                VVedge = np.array([((VVnode[key[0]][0] + VVnode[key[1]][0])/2,(VVnode[key[0]][1] + VVnode[key[1]][1])/2) for key in self._edge_keys])
+                VV_edges = {j: VVedge[i] for i,j in enumerate(self._edge_keys)}
+                nx.set_edge_attributes(Graph,VV_edges,'basal_velocity_vector')
+
+            #get status from graph
+            status = nx.get_edge_attributes(Graph,'status')
+
+            #convert ub_vec into unit vector and magnitude
+            ub_mags = np.array([np.linalg.norm(VV_edges[edge]) for edge in self._edge_keys])
+            ub_vs = np.array([(VV_edges[edge][0],VV_edges[edge][1]) for edge in self._edge_keys])
+            ub_uvs = [j/ub_mags[i] for i,j in enumerate(ub_vs)]
+            
+            #we need to map the scalar properties onto a 2D array 
+            #make masked array
+            self._TN = np.any(self._TNN!=0, axis = 2).astype(np.float64)
+            #multiply by scalars
+            T_length = self._TN*self._length
+            T_Q_mag = self._TN*self._advection_Q
+            
+            #and stack the vector quantities into a 3D array
+            T_uvs = np.array([ub_uvs]*len(self._TN))
+            #get local Q across edges in direction of outward normals given basal velocity direction
+            self._TQs = np.einsum('mno,mno ->mn',self._TNN,T_uvs)*T_length*T_Q_mag
+ 
+            #solve the flow so as to conserve mass for each triangle 
+            Sol, PredQs = unconstrained_least_squares_arr(self._TNN,T_length,T_uvs,self._TQs)
+            
+            # for singleton edges we just keep T_Qs, but need to add back to the PredQs
+            PredQs = np.concatenate((PredQs,self._TQs[-1:,:]), axis = 0)
+            
+            #flux from the triangle into the edge is positive sign
+            Qin = np.where(np.max(PredQs, axis = 0) > 0,np.max(PredQs, axis = 0),0) 
+            
+            #flux from the edge out to the triangle is negative
+            Qout = np.where(np.min(PredQs, axis = 0) < 0,np.min(PredQs, axis = 0),0) 
+             
+            #We filter Qin,Qout,Qres depending on Boundary Condition
+            isPartBoundary = np.array([True if BC=='boundary' else False for edge,BC in self._EB_Dict.items()])
+            isLinear = np.array([True if BC=='linear' else False for edge,BC in self._EB_Dict.items()])
+            isOutlet = np.array([True if status==0 else False for edge,status in status.items()])
+            isBoundary = np.array([True if status==3 else False for edge,status in status.items()])
+            
+            #for normal edges - we do nothing    
+            
+            #for partition boundary edges when harmonising we select the upstream edge so we would get (generally) accumulation if left free
+            #here we enforce a Qin=Qout boundary condition on them, so H does not change, comment these next lines out for a free boundary condition
+            Qin = np.where((isPartBoundary & ~isOutlet & (Qin==0)),-Qout, Qin)
+            Qout = np.where((isPartBoundary & ~isOutlet & (Qout==0)),-Qin, Qout)
+            #regular re-partitioning will mitigate this effect, either way
+          
+            #for true boundary edges we match input and output, so Qres is 0
+            Qin = np.where((isBoundary & ~isOutlet & (Qin==0)),-Qout, Qin)
+            Qout = np.where((isBoundary & ~isOutlet & (Qout==0)),-Qin, Qout)
+            
+            #for outlet boundary edges we adjust the Qout to not constrain H if flow from the triangle is not the same as the local Qs
+            #this MIGHT be either an inlet or outlet to the partition  - the point is the free boundary condition
+            # we get the average of the edge across all triangles, although boundary edges have just one triangle so there should be exactly one entry
+            Qs_loc = np.divide(np.nansum(self._TQs, axis = 0),np.count_nonzero(self._TQs, axis = 0), out=np.zeros_like(np.nansum(self._TQs, axis = 0)), where = np.count_nonzero(self._TQs, axis = 0)!= 0)
+            Qout = np.where(isOutlet & isPartBoundary,-Qs_loc, Qout)
+            
+            #for linear edges we just enforce the sign convention for local Qs
+            Qin_lin = np.abs(Qs_loc)
+            self._advection_Qin = np.where(isLinear,Qin_lin,Qin)
+            SetGraphAttributeFromArray(Graph, self._advection_Qin, self._edge_keys, 'advection_Qin')
+            self._advection_Qout = np.where(isLinear,-Qin_lin,Qout)
+            SetGraphAttributeFromArray(Graph, self._advection_Qout, self._edge_keys, 'advection_Qout')
+        elif mesh == 'quadrilateral':
+            raise ValueError(' quadrilatral meshes not implemented yet')
+        else:
+            raise ValueError('recgonised mesh geometries are "triangular" and "quadrilateral"')
         return Graph
     
     #The following are calculated each timestep regardless of steady state or dynamic
@@ -538,8 +1082,8 @@ class SubglacialErosionandSedimentFlux():
             conC = np.logical_and(conA == False, conB == False) #transport or supply limited case
                     
             #report the con to the graph for QC
-            whichcon1 = np.where(conC,'C','B')
-            con = np.where(conA,'A',whichcon1)
+            #whichcon1 = np.where(conC,'C','B')
+            #con = np.where(conA,'A',whichcon1)
             #SetGraphAttributeFromArray(Graph, con, self._edge_keys, 'con')
             
             #sediment flux gradient on edge
@@ -548,6 +1092,157 @@ class SubglacialErosionandSedimentFlux():
         #report to graph
         SetGraphAttributeFromArray(Graph, self._dQSdx, self._edge_keys, 'dQSdx')
         return Graph
+
+    def _rescale_advection_flux_sp(self, Graph = None, mesh = 'triangular'):
+        '''this function takes the previously calculated flux and ses according to sedeiment availability:
+           We seek to establish if enough sediment exists for till deformation to occur
+           Each edge is mapped individually from its adjacent triangles
+           boundary conditions are as before: 
+                  domain boundary edges conserve mass (Qin = Qout on domain boundary edges)
+                  downstream boundary edges (outlets) do not conserve mass
+                  isolated edges conserve mass except where outlet edges
+        '''
+        if Graph == None:
+            Graph = ray.get(self._graph)
+        
+        #check attributes exist
+        self.CheckAttributes(Graph)
+        
+        # if we dont have TN and TQs, we need to re-run the geometry and flux calculations
+        # this is expected for a new partition
+        if hasattr(self,'_TN') and hasattr(self,'_TQs'):
+            pass
+        else:
+            #Graph = self._calc_advection_geometry(Graph)
+            #Graph = self._calc_advection_flux(Graph)
+            Graph = self._calc_advection_geometry_sp(Graph)
+            Graph = self._calc_advection_flux_sp(Graph)
+
+    
+        if mesh == 'triangular':
+            #Rescaling flux assuming a triangular mesh. Edges that do not form triangle edges may not be correctly modelled
+            #get necessary data from graph
+            H = GetGraphAttributeToArray(Graph, 'till_thickness')
+            if len(H) != Graph.number_of_edges():
+                print('till thickness not available, initialising as random')
+                l = lambda c: self._InitTill/2+np.random.rand()*self._InitTill
+                H = np.array([l(c) for c in self._length])
+            #enforce non-negative H and T
+            H = np.where(H<0,0,H)
+            T = np.where(self._advection_T<0,0,self._advection_T)
+            effT = np.minimum(H,T)
+            SF = np.divide(effT, T, out=np.ones_like(effT), where=T!=0)
+            
+            #we need to map the scalar properties onto a 2D array 
+            #T_D = 1 if TQs > 0 else 0 (sparse)
+            T_D_data = (self._TQs.data > 0).astype(np.float64)
+            T_D = sp.csr_matrix((T_D_data, self._TQs.indices, self._TQs.indptr), shape=self._TQs.shape)
+            
+            #multiply TN by scalars
+            #T_H = TN * H, T_T = TN * T (sparse)
+            T_H = self._TN.multiply(H).tocsr()
+            T_T = self._TN.multiply(T).tocsr()
+            
+            # get the mean H and T for each triangle - we ignore 'triangles' with no edges 
+            T_num_edges = np.diff(self._TN.indptr)
+            Tri_H_sum = np.array(T_H.sum(axis=1)).flatten()
+            Tri_T_sum = np.array(T_T.sum(axis=1)).flatten()
+            
+            Tri_H = np.divide(Tri_H_sum, T_num_edges, out=np.zeros_like(Tri_H_sum), where=T_num_edges!=0)
+            Tri_T = np.divide(Tri_T_sum, T_num_edges, out=np.zeros_like(Tri_T_sum), where=T_num_edges!=0)
+            
+            Tri_effT = np.minimum(Tri_H,Tri_T)
+            Tri_SF = np.divide(Tri_effT,Tri_T,out=np.ones_like(Tri_effT),where = Tri_T!=0)
+            
+            #rescale Qout based on the local conditions
+            self._advection_Qout_scaled = self._advection_Qout * SF
+            
+            #we rescale Qin based on the donor triangle, if there is one, and otherwise from the local conditions 
+            #Qin_scale = sum over triangles (T_D * Tri_SF)
+            # This is a row-wise multiplication of T_D by Tri_SF then column sum
+            T_D_scaled = T_D.multiply(Tri_SF[:, None]).tocsr()
+            Qin_scale = np.array(T_D_scaled.sum(axis=0)).flatten()
+            
+            #apply mask
+            self._advection_Qin_scaled = np.where(Qin_scale!=0,self._advection_Qin*Qin_scale,self._advection_Qin * SF) 
+            #calculate scaled residual
+            self._advection_Qres_scaled = self._advection_Qin_scaled + self._advection_Qout_scaled
+            #for output
+            SetGraphAttributeFromArray(Graph, self._advection_Qin_scaled, self._edge_keys, 'advection_Qin_scaled')
+            SetGraphAttributeFromArray(Graph, self._advection_Qout_scaled, self._edge_keys, 'advection_Qout_scaled')
+            SetGraphAttributeFromArray(Graph, self._advection_Qres_scaled, self._edge_keys, 'advection_Qres_scaled')   
+        elif mesh == 'quadrilateral':
+            #Calculating flux assuming a quadrilateral mesh. Edges that do not form quadrilateral edges may not be correctly modelled
+            raise ValueError(' quadrilatral meshes not implemented yet')
+        else:
+            raise ValueError('recgonised mesh geometries are "triangular" and "quadrilateral"')
+        return Graph 
+
+
+    def _rescale_advection_flux(self, Graph = None, mesh = 'triangular'):
+        '''this function takes the previously calculated flux and ses according to sedeiment availability:
+           We seek to establish if enough sediment exists for till deformation to occur
+           Each edge is mapped individually from its adjacent triangles
+           boundary conditions are as before: 
+                  domain boundary edges conserve mass (Qin = Qout on domain boundary edges)
+                  downstream boundary edges (outlets) do not conserve mass
+                  isolated edges conserve mass except where outlet edges
+        '''
+        if Graph == None:
+            Graph = ray.get(self._graph)
+        
+        #check attributes exist
+        self.CheckAttributes(Graph)
+        
+        # if we dont have TN and TQs, we need to re-run the geometry and flux calculations
+        # this is expected for a new partition
+        if hasattr(self,'_TN') and hasattr(self,'_TQs'):
+            pass
+        else:
+            Graph = self._calc_advection_geometry(Graph)
+            Graph = self._calc_advection_flux(Graph)
+
+        if mesh == 'triangular':
+            #Rescaling flux assuming a triangular mesh. Edges that do not form triangle edges may not be correctly modelled
+            #get necessary data from graph
+            if "till_thickness" in self._edge_attributes:
+                H = GetGraphAttributeToArray(Graph, 'till_thickness')
+            else:
+                raise ValueError('till thickness not available')
+            #enforce non-negative H and T
+            H = np.where(H<0,0,H)
+            T = np.where(self._advection_T<0,0,self._advection_T)
+            effT = np.minimum(H,T)
+            SF = effT/T
+            #we need to map the scalar properties onto a 2D array 
+            T_D = np.where(self._TQs > 0,1,0)
+            #multiply TN by scalars
+            T_H = self._TN*H
+            T_T = self._TN*T
+            # get the mean H and T for each triangle - we ignore 'triangles' with no edges 
+            T_num_edges = np.count_nonzero(self._TN, axis=1)
+            Tri_H = np.divide(np.nansum(T_H, axis = 1),T_num_edges,out=np.zeros_like(np.nansum(T_H, axis = 1)),where=T_num_edges!=0)
+            Tri_T = np.divide(np.nansum(T_T, axis = 1),T_num_edges,out=np.zeros_like(np.nansum(T_T, axis = 1)),where=T_num_edges!=0)           
+            Tri_effT = np.minimum(Tri_H,Tri_T)
+            Tri_SF = np.divide(Tri_effT,Tri_T,out=np.ones_like(Tri_effT),where = Tri_T!=0)
+            #rescale Qout based on the local conditions
+            self._advection_Qout_scaled = self._advection_Qout * SF
+            #we rescale Qin based on the donor triangle, if there is one, and otherwise from the local conditions 
+            Qin_scale = np.sum(T_D*Tri_SF[:,None], axis = 0)
+            #apply mask
+            self._advection_Qin_scaled = np.where(Qin_scale!=0,self._advection_Qin*Qin_scale,self._advection_Qin * SF) #need to sort out shapes and broadcasting
+            #calculate scaled residual
+            self._advection_Qres_scaled = self._advection_Qin_scaled + self._advection_Qout_scaled
+            #for output
+            SetGraphAttributeFromArray(Graph, self._advection_Qin_scaled, self._edge_keys, 'advection_Qin_scaled')
+            SetGraphAttributeFromArray(Graph, self._advection_Qout_scaled, self._edge_keys, 'advection_Qout_scaled')
+            SetGraphAttributeFromArray(Graph, self._advection_Qres_scaled, self._edge_keys, 'advection_Qres_scaled')   
+        elif mesh == 'quadrilateral':
+            #Calculating flux assuming a quadrilateral mesh. Edges that do not form quadrilateral edges may not be correctly modelled
+            raise ValueError(' quadrilatral meshes not implemented yet')
+        else:
+            raise ValueError('recgonised mesh geometries are "triangular" and "quadrilateral"')
+        return Graph 
 
     def _calc_till_transport(self, Graph = None):
         if Graph == None:
@@ -822,11 +1517,14 @@ class SubglacialErosionandSedimentFlux():
         #check attributes exist
         self.CheckAttributes(Graph)
                 
-        """method to calculate transport of till on the network using a kinematic wave approach"""
-        # A kinematic-wave transport model conserving volume is used see Newell 1993 Transport Research B vol 27B part I-III
-        # active sediment flux is stored as a transient flux density k, in m^3/m
-        # and we develop a 'jam' condition where this reaches a maximum
-        # jams propagate upstream, and clear downstream - this ensures we never exceed flux capacity
+        """method to calculate transport of till on the network using a kinematic wave approach
+        A kinematic-wave transport model conserving volume is used see Newell 1993 Transport Research B vol 27B part I-III
+        active sediment flux is stored as a transient flux density k, in m^3/m
+        and we develop a 'jam' condition where this reaches a maximum
+        jams propagate upstream, and clear downstream - this ensures we never exceed flux capacity
+        
+        lite mode uses a reduced functionality with reespect to grain size evolution and no detritus tracking is done'''
+        """
 
         # if k doesn't exist already we initialise as zero
         if "flux_density" in self._edge_attributes:
@@ -909,9 +1607,12 @@ class SubglacialErosionandSedimentFlux():
         #arrays for volume to and from node 
         VStoNode = np.zeros_like(Graph.nodes(), dtype = float)
         VScfromNode = np.zeros_like(Graph.nodes(), dtype = float)
+        # a list for the density distributions
+        d_dists = [None]*len(Graph.nodes())
         #iterate through the nodes
         for t,u in enumerate(Graph.nodes()):
             vols = []
+            dists = []
             for key in Graph.pred[u]:
                 if Graph.nodes[key]['node_status'] > 0: #no outlet or floating nodes
                     v = Graph.pred[u][key]['VSout']
@@ -919,7 +1620,16 @@ class SubglacialErosionandSedimentFlux():
                         vols.append(v) 
                     else: 
                         vols.append(0)
+                    dist = Graph.pred[u][key]['d_distribution']
+                    if np.isfinite(dist[0]) and np.isfinite(dist[1]):
+                        dists.append(dist)
+                    else: 
+                        dists.append((self._meanD, self._stdD))
             VStoNode[t]=np.sum(vols)
+            if len(dists)>0:
+                d_dists[t] = CombineDdists_Simple(dists,vols/VStoNode[t])[1]
+            else:
+                d_dists[t] = (self._meanD, self._stdD)
             for key in Graph.succ[u]:
                 if Graph.succ[u][key]['status'] != 0: #no constraint from outlet segments
                     qc = Graph.succ[u][key]['VScap']
@@ -932,6 +1642,10 @@ class SubglacialErosionandSedimentFlux():
                         VScfromNode[t]+=0
                     else:
                         VScfromNode[t]+=qc
+
+        # report nodal grain size to graph
+        d_dist_node = {u:d_dists[i] for i,u in enumerate(self._node_keys)}
+        nx.set_node_attributes(Graph,d_dist_node, 'd_dist_node')        
 
         #if incoming volume exceeds capacity define a backflow
         Backflow = np.where(VStoNode > VScfromNode, VStoNode-VScfromNode, 0.0)
@@ -988,6 +1702,73 @@ class SubglacialErosionandSedimentFlux():
         
         #update flux density on the graph
         SetGraphAttributeFromArray(Graph, k, self._edge_keys, 'flux_density')
+                
+        #Now recalculate the grain size distribution for edges given the volumes in and out and residual sediment
+        #in lite mode we use anaytical functions not samples
+        
+        #begin with the global distribution, adding a small perturbation within 95 % confidence
+        ME = 1.96 *(self._stdD/np.sqrt(self._samp_n))
+        newDs = [(self._meanD+random.uniform(-ME,ME), self._stdD) for i in self._edge_keys]
+        
+        #input distributions from nodes
+        d_dist_in = [d_dist_node[u] for i,(u,v) in enumerate(self._edge_keys)]
+        
+        #volumetric proportions defind using function MixVols
+        PVolArrays = MixVols(VolArrays)
+        P_as_edge = PVolArrays[0]
+        #SetGraphAttributeFromArray(Graph, P_as_edge, self._edge_keys, 'pV_edge')
+        P_as_node = PVolArrays[1]
+        #SetGraphAttributeFromArray(Graph, P_as_node, self._edge_keys, 'pV_node')
+        P_basal = PVolArrays[2]
+        #SetGraphAttributeFromArray(Graph, P_basal, self._edge_keys, 'pV_sed')
+        P_basement = PVolArrays[3]
+        #SetGraphAttributeFromArray(Graph, P_basement, self._edge_keys, 'pV_base')
+        
+        #volume proportions for each volume element
+        volPs = [[P_as_edge[i],P_as_node[i],P_basal[i],P_basement[i]] for i,j in enumerate(self._edge_keys)]
+        
+        #dist for each volume element
+        try:
+            dists = [[self._d_dist[i],d_dist_in[i],self._sed_d_dist[i], newDs[i]] for i,j in enumerate(self._edge_keys)]
+        except IndexError:
+            raise("Index error accessing arrays")
+        #get new edge distributions with function CombineDdists
+        edge_dists = [CombineDdists_Simple(dists[i],volPs[i]) for i,j in enumerate(self._edge_keys)]
+        
+        #get new grainsize distribution for the basal sediment layer
+        #volume of till on edge:
+        TTedge = GetGraphAttributeToArray(Graph, 'till_thickness')
+        VT = TTedge*(1-self._bed_porosity)*self._edgewidth
+        # volume deposited/mobilised - one should be zero
+        VSdep = VolArrays[2]
+        VSmob = VolArrays[4]
+
+        # as a proportion
+        Pdep = np.where(np.isfinite(VSdep/(VT+VSmob+VSdep)),VSdep/(VT+VSmob+VSdep),0.0)
+        Pmob = np.where(np.isfinite(VSmob/(VT+VSmob+VSdep)),VSmob/(VT+VSmob+VSdep),0.0)
+        Pbas = np.where(np.isfinite(VT/(VT+VSmob+VSdep)),VT/(VT+VSmob+VSdep),0.0)
+        
+        #first we need to add VSdep to VT
+        volPs = [[Pdep[i],Pbas[i]] for i,j in enumerate(self._edge_keys)]
+        dists = [[edge_dists[i][1], self._sed_d_dist[i]] for i,j in enumerate(self._edge_keys)]
+        basal_dists = [CombineDdists_Simple(dists[i],volPs[i]) for i,j in enumerate(self._edge_keys)]
+        
+        #then we need to remove VSmob from the combination
+        volPs = [[Pbas[i]+Pdep[i],Pmob[i]] for i,j in enumerate(self._edge_keys)]
+        dists = [[basal_dists[i][1],dists[i][0]] for i,j in enumerate(self._edge_keys)]
+        basal_dists = [ExtractDdists_Simple(dists[i],volPs[i],warnonly = False) for i,j in enumerate(self._edge_keys)]
+        
+        #report to graph
+        #edge
+        a = {(u,v): edge_dists[i][0] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(Graph,a,'d_median')
+        a = {(u,v): edge_dists[i][1] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(Graph,a,'d_distribution')
+        #basal
+        a = {(u,v): basal_dists[i][0] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(Graph,a,'sed_d_median')
+        a = {(u,v): basal_dists[i][1] for i,(u,v) in enumerate(self._edge_keys)}
+        nx.set_edge_attributes(Graph,a,'sed_d_distribution')
         return Graph,VolArrays
 
     def _calc_Exner_equation(self, Graph = None):
@@ -998,6 +1779,9 @@ class SubglacialErosionandSedimentFlux():
         self.CheckAttributes(Graph)
            
         """method to calculate evolving till thickness according to Exner Equation"""
+        #get existing till thickness
+        TT = GetGraphAttributeToArray(Graph, 'till_thickness')
+        
         #formulation equivalent to Delaney's Julia code - but here with porosity
         dHdt = (-self._dQSdx/(1-self._bed_porosity)+self._mt/(1-self._bed_porosity))/self._edgewidth
         
@@ -1008,14 +1792,28 @@ class SubglacialErosionandSedimentFlux():
         #bedrock lowering from erosion - no porosity
         dBRE = -self._mt*self._dt/self._edgewidth
         
+        #new till thickness
+        NewTill = self._dt*dHdt+XVasH/(1-self._bed_porosity)
+        TT += NewTill
+       
+        if self._advection_method !="None":
+            #calculate advection residual
+            advection_Qres = self._advection_Qin + self._advection_Qout
+            #here include Qres from advection into dHdt      
+            advection_dHdt = advection_Qres/(self._edgewidth*self._length)
+            #calculate thickness
+            advection_H = self._dt*advection_dHdt
+            #Do we cross the advection limit? if so we will truncate
+            con = np.where((TT > self._advection_T) & (TT + advection_H < self._advection_T),True,False)
+            ATH = self._advection_T-TT
+            #apply the adjustment including the limit
+            TT = np.where(con, TT + ATH, TT + advection_H)
+            # and dHdt also
+            dHdt = np.where(con, dHdt+ATH/self._dt, dHdt + advection_dHdt)
+        
         #report to graph
         SetGraphAttributeFromArray(Graph, dHdt, self._edge_keys, 'dHdt')
         SetGraphAttributeFromArray(Graph, dBRE, self._edge_keys, 'dBRE')
-        
-        NewTill = self._dt*dHdt+XVasH/(1-self._bed_porosity)
-        
-        #update till thickness on graph
-        TT = GetGraphAttributeToArray(Graph, 'till_thickness')+NewTill
         SetGraphAttributeFromArray(Graph, TT, self._edge_keys, 'till_thickness')
         
         #update downwind node only with mean till thickness of upwind links
@@ -1154,6 +1952,11 @@ class SubglacialErosionandSedimentFlux():
             P_as_edge = self._PVolArrays[0]
             P_as_node = self._PVolArrays[1]
             P_basal = self._PVolArrays[2]
+            if self._advection_method != "None":
+                #we will have to add in here the effects from advection
+                #but first we need to figure it out and add a function to advection codes()
+                P_basal_advection = P_basal * 0.0 
+                P_basal += P_basal_advection
             P_basement = self._PVolArrays[3]
             #total proportion should be 1
             TP = P_as_edge+P_as_node+P_basal+P_basement
@@ -1168,7 +1971,7 @@ class SubglacialErosionandSedimentFlux():
                     Dclasses = ['init','basal','basement']
                 for i,key in enumerate(self._edge_keys):
                     if np.abs(1-TP[i]) > 0.01:
-                        print('WARNING: edge {} has total probability {} not adding to 1, using init, but check for NANs or negative volumes'.format(key,TP[i]))
+                        print('WARNING: edge {} has total probability {} not adding to 1, using init, but check for NANs or negative volumes'.format(key,TP[i]), flush = True)
                         ps = np.array([1,0,0])
                     else:
                         Basal = np.array([0,1,0])* P_basal[i]  # mobilised from the bed
@@ -1195,7 +1998,6 @@ class SubglacialErosionandSedimentFlux():
                 except KeyError:
                     # if not given we find those of the active graph...
                     Dclasses = ['init','basal','basement']+list(set([prop[n] for n in prop]))
-                    #print('Det classes {}'.format(Dclasses))
                 # work out detritus on the edge
                 for i,key in enumerate(self._edge_keys):
                     #add any unrepresented classes to Dclasses
@@ -1203,17 +2005,14 @@ class SubglacialErosionandSedimentFlux():
                     newclasses = [item for item in classlist if item not in Dclasses]
                     if len(newclasses) > 0:
                         Dclasses += newclasses
-                        #print('added Det classes from basal {}'.format(newclasses))
                     classlist = list(det[key].keys())
                     newclasses = [item for item in classlist if item not in Dclasses]
                     if len(newclasses) > 0:
                         Dclasses += newclasses
-                        #print('added Det classes from edge {}'.format(Dclasses))
                     classlist = list(det_n[key[0]].keys())
                     newclasses = [item for item in classlist if item not in Dclasses]
                     if len(newclasses) > 0:
                         Dclasses += newclasses
-                        #print('added Det classes from node {}'.format(newclasses))
                     #get detritus prop at upstream and downstream nodes
                     DPu, DPv = prop[key[0]],prop[key[1]] 
                     #are these the same?
@@ -1299,86 +2098,6 @@ class SubglacialErosionandSedimentFlux():
         #record last_time on subgraph edges
         SetGraphAttributeFromArray(Graph, self._time, self._edge_keys, 'last_time')
         return Graph
-
-#on a 'steady' setup we have steady state inputs for hydraulic potential (or relevant inputs), hydrology input and erosion rate 
-#thus we can calculate these once only
-
-    def initialise_steady(self):
-        #get graph attribute list
-        G,self._dt = self._get_graph_atts()
-        #recalculate updated Hydraulic Potential Gradient for network grid
-        G = self._calc_HydraulicPotentialGradient(Graph = G)
-        #calculate hydrology flow for network grid
-        G = self._calc_channel_flux_on_edge(Graph = G)
-        G = self._calc_channel_flux_to_node(Graph = G)
-        #calculate erosion rate
-        G = self._calc_erosion_rate(Graph = G)
-        self._graph = ray.put(G)
-
-    def initialise_steady_parallel(self, n_procs = os.cpu_count()):
-        #this works itself but does not return 'self' parmaters from tasks
-        #these are: self._cflux 
-        #get SubGraphs
-        Graph = ray.get(self._graph)
-        E_Graphs = SplitGraphbyEdges(Graph, list(Graph.edges), processes=n_procs)
-        def task(G):
-            #get graph attribute list
-            self._get_graph_atts(Graph = G)
-            #recalculate updated Hydraulic Potential Gradient for network grid
-            G = self._calc_HydraulicPotentialGradient(Graph = G)
-            #calculate link flow for network grid
-            G = self._calc_channel_flux_on_edge(Graph = G)
-            #calculate erosion rate
-            G = self._calc_erosion_rate(Graph = G)
-            return G
-        def update_main(Graph,G):
-            edges = G.edges(data = True)
-            Graph.add_edges_from(edges)
-            return Graph
-        @ray.remote
-        def run_task(G):
-            return task(G)
-        results = [run_task.remote(E_Graphs[i]) for i in range(len(E_Graphs))]
-        while len(results):
-           done_id,results = ray.wait(results)
-           Graph = update_main(Graph,ray.get(done_id[0]))
-        self._graph = ray.put(Graph)
-    
-    # for timesteps we resolve the downstream flow of water and sediment
-    def run_one_step_steady(self, time, lite = False):
-        if type(time) is not int:
-            time = int(time)
-        #get new time
-        self._update_time(time)
-        #get graph attribute list for each iteration
-        G,self._dt = self._get_graph_atts() #issue is here?
-        #change density and grain size information
-        G = self._calculate_edge_d_and_rhos(Graph = G)
-        #calculate transport capacity
-        G = self._update_transport(Graph = G)
-        #calculate the till mobilisation
-        G = self._calc_till_mobilisation(Graph = G)
-        #calculate the till transport
-        if lite:
-            G, self._VolArrays = self._calc_till_transport_lite(Graph = G)
-        else:
-            G, self._VolArrays, self._PVolArrays = self._calc_till_transport(Graph = G)
-        #calculate Exner equation
-        G = self._calc_Exner_equation(Graph = G)
-        #track detritus
-        G = self._DetritusTracking(Graph = G)
-        #calculate hydrology flow accummulation for next timestep
-        self._calc_channel_flux_to_node(Graph = G)
-        #reset graph time
-        G = self._reset_graph_time(Graph = G)
-        return G
-
-    def get_graph(self):
-        Graph = ray.get(self._graph)
-        return(Graph)
-    
-    def set_graph(self, Graph):
-            self._graph = ray.put(Graph)
     
     def CheckAttributes(self,Graph):
         # check for existence of necessary attributes not defined in __init__
@@ -1420,20 +2139,130 @@ class SubglacialErosionandSedimentFlux():
          except AttributeError:
              self._dQSdx = GetGraphAttributeToArray(Graph, 'dQSdx')
          try:
-             self._d_dist = getattr(self,'_d_dist')
-         except AttributeError:
-             self._d_dist = GetGraphAttributeToArray(Graph, 'd_distribution')
-         try:
-             self._sed_d_dist = getattr(self,'_sed_d_dist')
-         except AttributeError:
-             self.sed_d_dist = GetGraphAttributeToArray(Graph, 'sed_d_distribution')
-         try:
              self._erod = getattr(self,'_erod')
          except AttributeError:
-             self._erod = GetGraphAttributeToArray(Graph, 'erosion_potential')  
+             self._erod = GetGraphAttributeToArray(Graph, 'erosion_potential')
+             
+         if self._detritus_method != 'None':    
+             try:
+                 self._d_dist = getattr(self,'_d_dist')
+             except AttributeError:
+                 self._d_dist = GetGraphAttributeToArray(Graph, 'd_distribution')
+             try:
+                 self._sed_d_dist = getattr(self,'_sed_d_dist')
+             except AttributeError:
+                 self.sed_d_dist = GetGraphAttributeToArray(Graph, 'sed_d_distribution')
+         if self._advection_method != 'None':
+             try:
+                 self._advection_T = getattr(self,'_advection_T')
+             except AttributeError:
+                 self._advection_T = GetGraphAttributeToArray(Graph, 'advection_thickness')
+             try:
+                 self._advection_Q = getattr(self,'_advection_Q')
+             except AttributeError:
+                 self._advection_Q = GetGraphAttributeToArray(Graph, 'advection_rate')
+             try:
+                 self._advection_Qout = getattr(self,'_advection_Qout')
+             except AttributeError:
+                 self._advection_Qout = GetGraphAttributeToArray(Graph, 'advection_Qout')
+             try:
+                 self._advection_Qin = getattr(self,'_advection_Qin')
+             except AttributeError:
+                 self._advection_Qin = GetGraphAttributeToArray(Graph, 'advection_Qin')           
+
+### Functins below here contorl the job run
+
+#on a 'steady' setup we have steady state inputs for hydraulic potential (or relevant inputs), hydrology input and erosion rate 
+#thus we can calculate these once only
+
+    def initialise_steady(self):
+        #get graph attribute list
+        G,self._dt = self._get_graph_atts()
+        #recalculate updated Hydraulic Potential Gradient for network grid
+        G = self._calc_HydraulicPotentialGradient(Graph = G)
+        #calculate hydrology flow for network grid
+        G = self._calc_channel_flux_on_edge(Graph = G)
+        G = self._calc_channel_flux_to_node(Graph = G)
+        #calculate erosion rate
+        G = self._calc_erosion_rate(Graph = G)
+        if self._advection_method != "None":
+            #calculate advection rate
+            G = self._calc_advection_rate(Graph = G)
+            #calculate advection geometry
+            #G = self._calc_advection_geometry(Graph = G, mesh = 'triangular')
+            #calculate advection flux
+            #G = self._calc_advection_flux(Graph = G, mesh = 'triangular')
+            G = self._calc_advection_geometry_sp(Graph = G, mesh = 'triangular')
+            #calculate advection flux
+            G = self._calc_advection_flux_sp(Graph = G, mesh = 'triangular')
+        self._graph = ray.put(G)
+
+    def initialise_steady_parallel(self, n_procs = os.cpu_count()):
+        #NOT BEEN UPDATED FOR AGES#
+        #this works itself but does not return 'self' parmaters from tasks
+        #these are: self._cflux 
+        #get SubGraphs
+        Graph = ray.get(self._graph)
+        E_Graphs = SplitGraphbyEdges(Graph, list(Graph.edges), processes=n_procs)
+        def task(G):
+            #get graph attribute list
+            self._get_graph_atts(Graph = G)
+            #recalculate updated Hydraulic Potential Gradient for network grid
+            G = self._calc_HydraulicPotentialGradient(Graph = G)
+            #calculate link flow for network grid
+            G = self._calc_channel_flux_on_edge(Graph = G)
+            #calculate erosion rate
+            G = self._calc_erosion_rate(Graph = G)
+            return G
+        def update_main(Graph,G):
+            edges = G.edges(data = True)
+            Graph.add_edges_from(edges)
+            return Graph
+        @ray.remote
+        def run_task(G):
+            return task(G)
+        results = [run_task.remote(E_Graphs[i]) for i in range(len(E_Graphs))]
+        while len(results):
+           done_id,results = ray.wait(results)
+           Graph = update_main(Graph,ray.get(done_id[0]))
+        self._graph = ray.put(Graph)
+    
+    def run_one_step_steady(self, time, lite = False):
+        if type(time) is not int:
+            time = int(time)
+        #get new time
+        self._update_time(time)
+        #get graph attribute list for each iteration
+        G,self._dt = self._get_graph_atts()
+        #change density and grain size information
+        G = self._calculate_edge_d_and_rhos(Graph = G)
+        #calculate transport capacity
+        G = self._update_transport(Graph = G)
+        #calculate the till mobilisation
+        G = self._calc_till_mobilisation(Graph = G)
+        #calculate the till transport
+        if lite:
+            G, self._VolArrays = self._calc_till_transport_lite(Graph = G)
+        else:
+            G, self._VolArrays, self._PVolArrays = self._calc_till_transport(Graph = G)
+        #if self._advection_method != "None":
+            #calculate rescaled advection for H
+            #G = self._rescale_advection_flux(Graph = G, mesh = 'triangular')
+         #   G = self._rescale_advection_flux_sp(Graph = G, mesh = 'triangular')
+        #calculate Exner equation
+        G = self._calc_Exner_equation(Graph = G)
+        #track detritus
+        if not lite:
+            G = self._DetritusTracking(Graph = G)
+        #calculate hydrology flow accummulation for next timestep
+        self._calc_channel_flux_to_node(Graph = G)
+        #reset graph time
+        G = self._reset_graph_time(Graph = G)
+        return G
 
     # or for dynamic time-variable inputs we do everything every timestep
     def run_one_step_dynamic(self, time):
+        #nneds to be updated as per above!#
         #get new time
         self._update_time(time)
         #get graph attribute list
@@ -1452,6 +2281,8 @@ class SubglacialErosionandSedimentFlux():
         self._calc_till_mobilisation()
         #calculate the till transport
         self._calc_till_transport()
+        #NEEDS ADVECTION
+        
         #calculate Exner equation
         self._calc_Exner_equation()
         #track detritus
@@ -1461,9 +2292,18 @@ class SubglacialErosionandSedimentFlux():
         #reset graph time
         self._reset_graph_time()
 
+    def get_graph(self):
+        Graph = ray.get(self._graph)
+        return(Graph)
+    
+    def set_graph(self, Graph):
+            self._graph = ray.put(Graph)
+    
+# this class is for the supervisor actor in Ray
+
 @ray.remote(max_restarts = 0)
 class SGST_supervisor():
-    def __init__(self, Graph, RNarray = None, n = None):
+    def __init__(self, Graph, RNarray = None, T_data = None, n = None):
         self._graph = Graph
         if RNarray is None:
             self._hasRNA = False
@@ -1513,7 +2353,7 @@ class SGST_supervisor():
         for ID in self._IDs:
             if ID != -1:
                 SG = makeSubgraph(p_IDs,ID)
-                print('part {}, num edges {}'.format(ID, SG.number_of_edges()))
+                print('part {}, num edges {}'.format(ID, SG.number_of_edges()), flush = True)
                 self._partitions[ID] = SG.copy()
                 if self._hasRNA:
                     num_edges = SG.number_of_edges()
@@ -1953,7 +2793,7 @@ def ExtractDdistsArray(Ddists, DvPs, RArray = None, n = None, def_mean = 0, def_
                         #make the Boolean array
                         Bool = np.full(BaseArray.shape, True, dtype = bool)
                         #make probability array for BaseArray given the distribution
-                        ProbArray = norm.pdf(BaseArray, loc=j[0], scale=j[1])
+                        ProbArray = stats.norm.pdf(BaseArray, loc=j[0], scale=j[1])
                         try:
                                 scale = 1.0/np.nansum(ProbArray)
                                 ProbArray = ProbArray*scale
@@ -1973,3 +2813,213 @@ def ExtractDdistsArray(Ddists, DvPs, RArray = None, n = None, def_mean = 0, def_
             median = (2**-def_mean)/1000.
             dist = (def_mean,def_std)
     return median,dist
+
+def CombineDdists_Simple(Dists, Vols):
+    """method to combine several normal distribution samples by volume
+    Considering a mixture Z = a*X + b*Y + ...,
+    E[Z] = a*E[X] + b*E[Y]
+    Var[Z] = a*(Var[X]^2 + E[X]^2) + b*(Var[Y]^2 + E[Y]^2) ... - E[Z]^2
+    the median will also be calculated"""
+    #get weights - normalised relative to total volume of included components
+    ws = np.array([vol/np.nansum(Vols) for vol in Vols])
+    #if the sum of Vols is 0 we don't have a valid mixture
+    #to avoid making nans we make an equal mix 
+    if not np.isfinite(ws).all():
+        v = 1/len(ws)
+        ws = np.ones_like(ws) * v
+    mus = np.array([d for (d,s) in Dists])
+    sigmas = np.array([s for (d,s) in Dists])
+    mix_mean = np.nansum(ws*mus)
+    l = lambda ws, mus, sigmas: np.nansum(ws * (sigmas**2 + mus**2)) - (np.nansum(ws * mus))**2
+    mix_std = np.sqrt(l(ws,mus,sigmas))
+    NewDist = (mix_mean,mix_std)
+    #calculate the median
+    mix_med = calc_median(ws,mus,sigmas)
+    median = (2**-mix_med)/1000.
+    return median,NewDist
+
+def ExtractDdists_Simple(Dists, Vols, warnonly = False):
+    """method to extract one or more distributions from another by volume
+    The first distribution is the 'base' distribution, the subsequent those to be removed
+    The median will also be calculated"""
+    #get weights - here we use Unnormalised volumes
+    ws = np.array([vol for vol in Vols])
+    #get dists
+    mus = np.array([d for (d,s) in Dists])
+    sigmas = np.array([s for (d,s) in Dists])
+    #the base value
+    base_mean = mus[0]
+    base_std = sigmas[0]
+    base_w = ws[0]
+    #default values if we don't have a valid subtraction
+    res_mean = base_mean
+    res_std = base_std
+    res_med = base_mean
+    if base_w > 0:
+        # mix the others for the extraction
+        mix_w = np.nansum(ws[1:])
+        #quick sanity checks - we cannot remove what does not exist
+        if mix_w > base_w:
+            mix_w = base_w
+        if mix_w > 0:
+            mix_mean = np.nansum(ws[1:]*mus[1:])/mix_w
+            l = lambda ws, mus, sigmas: np.nansum(ws[1:] * (sigmas[1:]**2 + mus[1:]**2))/mix_w - mix_mean**2
+            mix_std = np.sqrt(l(ws,mus,sigmas))
+            # now subtract the mix from the base
+            if can_subtract(base_w,base_mean,base_std,mix_w,mix_mean,mix_std) or warnonly:            
+                res_mean = (base_w*base_mean - mix_w*mix_mean)/(base_w-mix_w)
+                var = (base_w*(base_std**2+base_mean**2)-mix_w*(mix_std**2+mix_mean**2))/(base_w-mix_w)-res_mean**2
+                #only if variance is > 0 we allow to proceed
+                if var > 0:
+                    res_std = np.sqrt((base_w*(base_std**2+base_mean**2)-mix_w*(mix_std**2+mix_mean**2))/(base_w-mix_w)-res_mean**2)
+                    try:
+                        res_med = calc_median_ex(np.array([base_w,mix_w]),np.array([base_mean,mix_mean]),np.array([base_std,mix_std]))
+                    except ValueError:
+                        res_med = res_mean
+                else:
+                    res_mean = base_mean
+        NewDist = (res_mean,res_std)
+        median = (2**-res_med)/1000.
+    else:
+        NewDist = (base_mean,base_std)
+        median = (2**-base_mean)/1000.
+    return median,NewDist
+
+def can_subtract(w1,mu1,sigma1,w2,mu2,sigma2):
+    w = w2/w1
+    A = 1/(2*sigma2**2)
+    B = 1/(2*sigma1**2)
+    a = A-B
+    b = -2*A*mu2 + 2*B*mu1
+    c = A*mu2**2 - B*mu1**2 + np.log(sigma2/sigma1)
+    xstar = -b/(2*a)
+    log_rmin = a*xstar**2 + b*xstar + c
+    rmin = np.exp(log_rmin)
+    return w <= rmin
+
+def calc_median(ws,mus,sigmas):
+    limU = np.nanmax(mus+2*sigmas)
+    limL = np.nanmin(mus-2*sigmas)
+    #check scale on ws
+    ws = ws/np.nansum(ws)
+    # The CDF of the mixture
+    def mixture_cdf(x):
+        CDF = ws[0] * stats.norm.cdf(x, mus[0], sigmas[0])
+        for n in range(1,len(ws)): 
+            CDF += ws[n] * stats.norm.cdf(x, mus[n], sigmas[n])
+        return CDF
+    # The root-finding function (we want CDF - 0.5 = 0)
+    def find_median(m):
+        return mixture_cdf(m) - 0.5
+    # Solve for median
+    median = opt.brentq(find_median, limL, limU)
+    return median
+
+def calc_median_ex(ws,mus,sigmas):
+    limU = np.nanmax(mus+2*sigmas)
+    limL = np.nanmin(mus-2*sigmas)
+    #ws scaled to 1 by first entry
+    ws = ws/ws[0]
+    #re-scale outcome to 1/weight of residual
+    s = 1/(ws[0]-ws[1])
+    # The CDF of the subtraction
+    def unmixture_cdf(x):
+        CDF = s*ws[0] * stats.norm.cdf(x, mus[0], sigmas[0]) - s*ws[1] * stats.norm.cdf(x, mus[1], sigmas[1])
+        if CDF < 0 or CDF > 1:
+            raise(ValueError)
+        return CDF
+    # The root-finding function (we want CDF - 0.5 = 0)
+    def find_median(m):
+        return unmixture_cdf(m) - 0.5 #True if 0
+    # Solve for median
+    median = opt.brentq(find_median, limL, limU)
+    return median
+
+def unconstrained_least_squares_arr(normals,lengths,uvs,Qs):
+    '''this function generates the least squares solution for triangles
+       with mass conservation - no storage on triangle'''
+    #remove last triangle (which is not a triangle)
+    normals = normals[:-1,:,:]
+    lengths = lengths[:-1,:]
+    uvs = uvs[:-1,:,:]
+    Qs = Qs[:-1,:]
+    #rescale Qs for each triangle
+    # in the end everything is scaled relative, but this avoids  
+    Qs = Qs-Qs.mean(axis = 1, keepdims = True)
+    #shape of the normals array
+    shape =  np.shape(normals)
+    #match the dimensions of lengths array to normals array 
+    lengths_r = lengths.reshape((shape[0],shape[1],1))
+    #C is the outward normals weighted by edge length
+    C = normals*lengths_r
+    #multiply the matrices C^T@C
+    A11 = np.einsum('mni,mnj->mij',C,C)
+    #flow-weighted sum of flow across normals  
+    rhs = np.einsum('mni,mn->mi', C,Qs)
+    #solve to get flow for the triangle A11@sol = rhs
+    sol = np.linalg.solve(A11,rhs[...,None]).squeeze(-1)
+    #for predicted values we take the dot product of the triangle flow and the edge normals
+    predQ = np.einsum('mi,mni->mn',sol,normals)*lengths 
+    return sol,predQ
+
+def unconstrained_least_squares_sparse(TNN_x, TNN_y, T_length, ub_uvs, Qs):
+    '''this function generates the least squares solution for triangles
+       with mass conservation - no storage on triangle.
+       Refactored to use sparse matrices to save memory.'''
+    #remove last triangle (which is not a triangle)
+    tx = TNN_x[:-1, :].tocsr()
+    ty = TNN_y[:-1, :].tocsr()
+    tl = T_length[:-1, :].tocsr()
+    tq = Qs[:-1, :].tocsr()
+    
+    #rescale Qs for each triangle
+    # in the end everything is scaled relative, but this avoids large values
+    # Qs = Qs-Qs.mean(axis = 1, keepdims = True)
+    q_sum = np.array(tq.sum(axis=1)).flatten()
+    q_mean = q_sum / 3.0 # Each triangle has 3 edges
+    
+    #C is the outward normals weighted by edge length
+    Cx = tx.multiply(tl).tocsr()
+    Cy = ty.multiply(tl).tocsr()
+    
+    #multiply the matrices C^T@C
+    # A11 = np.einsum('mni,mnj->mij',C,C)
+    # A11 for triangle m is a 2x2 matrix:
+    # [ sum(Cx_mi^2), sum(Cx_mi*Cy_mi) ]
+    # [ sum(Cx_mi*Cy_mi), sum(Cy_mi^2) ]
+    
+    Cx2 = Cx.power(2).sum(axis=1)
+    Cy2 = Cy.power(2).sum(axis=1)
+    Cxy = Cx.multiply(Cy).sum(axis=1)
+    
+    A11_00 = np.array(Cx2).flatten()
+    A11_01 = np.array(Cxy).flatten()
+    A11_11 = np.array(Cy2).flatten()
+    
+    #rhs = np.einsum('mni,mn->mi', C,Qs)
+    # rhs_x = sum_i Cx_mi * (Qs_mi - Qs_mean_m)
+    # rhs_x = sum_i (Cx_mi * Qs_mi) - Qs_mean_m * sum_i (Cx_mi)
+    Cx_sum = np.array(Cx.sum(axis=1)).flatten()
+    Cy_sum = np.array(Cy.sum(axis=1)).flatten()
+    
+    rhs_x = np.array(Cx.multiply(tq).sum(axis=1)).flatten() - q_mean * Cx_sum
+    rhs_y = np.array(Cy.multiply(tq).sum(axis=1)).flatten() - q_mean * Cy_sum
+    
+    #solve to get flow for the triangle A11@sol = rhs
+    # det = A11_00 * A11_11 - A11_01^2
+    det = A11_00 * A11_11 - A11_01**2
+    # Handle det=0
+    det_inv = np.zeros_like(det)
+    mask = det != 0
+    det_inv[mask] = 1.0 / det[mask]
+    
+    sol_x = (A11_11 * rhs_x - A11_01 * rhs_y) * det_inv
+    sol_y = (-A11_01 * rhs_x + A11_00 * rhs_y) * det_inv
+    
+    #for predicted values we take the dot product of the triangle flow and the edge normals
+    #predQ = np.einsum('mi,mni->mn',sol,normals)*lengths 
+    # predQ = (sol_x * tx + sol_y * ty) * tl
+    predQ = tx.multiply(sol_x[:, None]) + ty.multiply(sol_y[:, None]).tocsr()
+    predQ = predQ.multiply(tl).tocsr()
+    
+    return np.stack([sol_x, sol_y], axis=1), predQ
